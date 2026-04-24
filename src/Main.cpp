@@ -37,39 +37,59 @@ int main (int argc, char* argv[])
     juce::Logger::writeToLog("Starting JUCE FFT OSC (press Enter to quit)");
 
     FFTOSC app (host, port);
-    // enable test tone if requested on CLI
+
+    // local mirrors of flag state for logging
+    bool testToneEnabled = false;
+    double testToneFreq = 0.0;
+    bool simpleSendEnabled = false;
+    int simpleSendBins = 0;
+    bool interpEnabled = false;
+    bool voiceOnlyEnabled = false;
+    double voiceMin = app.getVoiceMinFreq();
+    double voiceMax = app.getVoiceMaxFreq();
     double mapMin = 0.0, mapMax = 0.0;
     bool mapMinSet = false, mapMaxSet = false;
+
     for (int i = 1; i < argc; ++i)
     {
         juce::String arg (argv[i]);
         if (arg == "--test-tone" && i + 1 < argc)
         {
-            float f = std::atof(argv[++i]);
-            if (f > 0.0f)
-                app.setTestTone(true, f);
+            double f = std::atof(argv[++i]);
+            if (f > 0.0)
+            {
+                testToneEnabled = true;
+                testToneFreq = f;
+                app.setTestTone(true, (float)f);
+            }
         }
         else if (arg == "--simple-send" && i + 1 < argc)
         {
             int b = std::atoi(argv[++i]);
+            simpleSendEnabled = true;
+            simpleSendBins = b;
             app.setSimpleSend(true, b);
         }
         else if (arg == "--interp")
         {
+            interpEnabled = true;
             app.setInterpMode(true);
         }
         else if (arg == "--voice-only")
         {
+            voiceOnlyEnabled = true;
             app.setSendVoiceOnly(true);
         }
         else if (arg == "--voice-min" && i + 1 < argc)
         {
             double v = std::atof(argv[++i]);
+            voiceMin = v;
             app.setVoiceRange(v, app.getVoiceMaxFreq());
         }
         else if (arg == "--voice-max" && i + 1 < argc)
         {
             double v = std::atof(argv[++i]);
+            voiceMax = v;
             app.setVoiceRange(app.getVoiceMinFreq(), v);
         }
         else if (arg == "--map-min" && i + 1 < argc)
@@ -92,6 +112,17 @@ int main (int argc, char* argv[])
         if (useMax > useMin)
             app.setMapFreqRange(useMin, useMax);
     }
+
+    // log active CLI flags so it's obvious what options were used
+    juce::String flagLog = "Flags: host=" + host + " port=" + juce::String(port)
+        + " testTone=" + (testToneEnabled ? juce::String(testToneFreq) : "off")
+        + " simpleSend=" + (simpleSendEnabled ? juce::String(simpleSendBins) : "off")
+        + " interp=" + (interpEnabled ? "on" : "off")
+        + " voiceOnly=" + (voiceOnlyEnabled ? "on" : "off")
+        + " voiceMin=" + juce::String(voiceMin) + " voiceMax=" + juce::String(voiceMax)
+        + " mapMinSet=" + (mapMinSet ? "yes" : "no") + " mapMin=" + juce::String(mapMin)
+        + " mapMaxSet=" + (mapMaxSet ? "yes" : "no") + " mapMax=" + juce::String(mapMax);
+    juce::Logger::writeToLog(flagLog);
 
     app.start();
 
