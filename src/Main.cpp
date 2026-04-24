@@ -97,7 +97,27 @@ int main (int argc, char* argv[])
             mapMin = std::atof(argv[++i]);
             mapMinSet = true;
         }
+        else if (arg.startsWith("--mapMinFreq="))
+        {
+            mapMin = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
+            mapMinSet = true;
+        }
+        else if (arg == "--mapMinFreq" && i + 1 < argc)
+        {
+            mapMin = std::atof(argv[++i]);
+            mapMinSet = true;
+        }
         else if (arg == "--map-max" && i + 1 < argc)
+        {
+            mapMax = std::atof(argv[++i]);
+            mapMaxSet = true;
+        }
+        else if (arg.startsWith("--mapMaxFreq="))
+        {
+            mapMax = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
+            mapMaxSet = true;
+        }
+        else if (arg == "--mapMaxFreq" && i + 1 < argc)
         {
             mapMax = std::atof(argv[++i]);
             mapMaxSet = true;

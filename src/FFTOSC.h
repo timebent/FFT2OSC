@@ -56,7 +56,7 @@ private:
     juce::CriticalSection amplitudesLock;
 
     int sendCounter = 0;
-    int sendLogLimit = 20; // log the first N sends verbosely for debugging
+    int sendLogLimit = 0; // controls verbose send logging (0 = disabled)
     int fftProducedCounter = 0;
     int timerCallCounter = 0;
 
