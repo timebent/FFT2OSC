@@ -1,6 +1,8 @@
 #include <JuceHeader.h>
 #include "FFTOSC.h"
 #include <thread>
+#include <chrono>
+#include <unistd.h>
 
 int main (int argc, char* argv[])
 {
@@ -41,14 +43,22 @@ int main (int argc, char* argv[])
     bool voiceOnlyEnabled = false;
     double voiceMin = app.getVoiceMinFreq();
     double voiceMax = app.getVoiceMaxFreq();
+    bool voiceMinSet = false, voiceMaxSet = false;
     int senderInterval = app.getSenderIntervalMs();
     bool rmsEnabled = app.getUseRMSAggregation();
     double mapMin = 0.0, mapMax = 0.0;
     bool mapMinSet = false, mapMaxSet = false;
     bool senderDiag = false;
+    bool shufflePlay = false;
     bool noNoiseFloor = false;
     double noiseFloorInitVal = -1.0; // negative means keep default
+    double baseNoiseFloorDb = std::numeric_limits<double>::quiet_NaN();
+    bool fixedNoiseFloor = false;
     // bin-range flag removed
+        bool playFiles = false;
+        juce::String playFilesList;
+        bool playDir = false;
+        juce::String playDirPath;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -150,6 +160,11 @@ int main (int argc, char* argv[])
             senderDiag = true;
             app.setSenderDiagnostic(true);
         }
+        else if (arg == "--shuffle-play")
+        {
+            shufflePlay = true;
+            app.setShufflePlayback(true);
+        }
         else if (arg.startsWith("--diag-sender="))
         {
             int v = arg.fromFirstOccurrenceOf("=", false, false).getIntValue();
@@ -157,6 +172,21 @@ int main (int argc, char* argv[])
             senderDiag = on;
             app.setSenderDiagnostic(on);
         }
+            else if (arg.startsWith("--play-files="))
+            {
+                playFiles = true;
+                playFilesList = arg.fromFirstOccurrenceOf("=", false, false);
+            }
+            else if (arg == "--play-dir" && i + 1 < argc)
+            {
+                playDir = true;
+                playDirPath = argv[++i];
+            }
+            else if (arg.startsWith("--play-dir="))
+            {
+                playDir = true;
+                playDirPath = arg.fromFirstOccurrenceOf("=", false, false);
+            }
         else if (arg == "--rms-agg")
         {
             rmsEnabled = true;
@@ -190,6 +220,33 @@ int main (int argc, char* argv[])
             noiseFloorInitVal = v;
             app.setNoiseFloorInit((float)v);
         }
+        else if (arg.startsWith("--base-noise-floor="))
+        {
+            // linear amplitude value provided directly
+            double v = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
+            noiseFloorInitVal = v;
+            app.setNoiseFloorInit((float)v);
+        }
+        else if (arg.startsWith("--base-noise-floor-db="))
+        {
+            // dB value: convert to linear amplitude (20*log10 reference)
+            double db = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
+            baseNoiseFloorDb = db;
+            double lin = std::pow(10.0, db / 20.0);
+            noiseFloorInitVal = lin;
+            app.setNoiseFloorInit((float)lin);
+        }
+        else if (arg == "--fixed-noise-floor")
+        {
+            fixedNoiseFloor = true;
+            app.setNoiseFloorFixed(true);
+        }
+        else if (arg.startsWith("--fixed-noise-floor="))
+        {
+            int v = arg.fromFirstOccurrenceOf("=", false, false).getIntValue();
+            fixedNoiseFloor = (v != 0);
+            app.setNoiseFloorFixed(fixedNoiseFloor);
+        }
         else if (arg == "--voice-only")
         {
             voiceOnlyEnabled = true;
@@ -220,17 +277,22 @@ int main (int argc, char* argv[])
         {
             double v = std::atof(argv[++i]);
             voiceMin = v;
-            app.setVoiceRange(v, app.getVoiceMaxFreq());
+            voiceMinSet = true;
         }
         else if (arg == "--voice-max" && i + 1 < argc)
         {
             double v = std::atof(argv[++i]);
             voiceMax = v;
-            app.setVoiceRange(app.getVoiceMinFreq(), v);
+            voiceMaxSet = true;
         }
         else if (arg == "--map-min" && i + 1 < argc)
         {
             mapMin = std::atof(argv[++i]);
+            mapMinSet = true;
+        }
+        else if (arg.startsWith("--map-min="))
+        {
+            mapMin = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
             mapMinSet = true;
         }
         else if (arg.startsWith("--mapMinFreq="))
@@ -246,6 +308,11 @@ int main (int argc, char* argv[])
         else if (arg == "--map-max" && i + 1 < argc)
         {
             mapMax = std::atof(argv[++i]);
+            mapMaxSet = true;
+        }
+        else if (arg.startsWith("--map-max="))
+        {
+            mapMax = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
             mapMaxSet = true;
         }
         else if (arg.startsWith("--mapMaxFreq="))
@@ -266,9 +333,106 @@ int main (int argc, char* argv[])
     {
         double useMin = mapMinSet ? mapMin : 80.0;
         double useMax = mapMaxSet ? mapMax : 24000.0;
-        if (useMax > useMin)
+        if (useMax >= useMin)
+        {
+            // If endpoints are equal, expand to a tiny window so downstream
+            // voice-range logic (which requires max>min) can accept it and so
+            // that a single-frequency selection still masks correctly.
+            if (useMax == useMin)
+            {
+                double eps = std::max(1.0, useMin * 0.001); // at least 1 Hz or 0.1%
+                double old = useMin;
+                useMin = std::max(1.0, useMin - eps);
+                useMax = old + eps;
+                juce::Logger::writeToLog("Map range endpoints equal: expanded to " + juce::String(useMin) + " - " + juce::String(useMax));
+            }
             app.setMapFreqRange(useMin, useMax);
+            // If the user explicitly provided both map-min and map-max, treat
+            // that as an implicit "voice-only" selection: apply the same
+            // voice-range and enable send-only-voice so bins outside this
+            // interval are zeroed.
+            if (mapMinSet && mapMaxSet)
+            {
+                voiceMin = useMin;
+                voiceMax = useMax;
+                voiceMinSet = true;
+                voiceMaxSet = true;
+                app.setVoiceRange(useMin, useMax);
+                app.setSendVoiceOnly(true);
+                juce::Logger::writeToLog("Map range provided: enabling voice-only masking for " + juce::String(useMin) + "-" + juce::String(useMax));
+            }
+        }
+        else
+        {
+            juce::Logger::writeToLog("Ignored map range: max must be >= min");
+        }
     }
+
+    // Apply voice range from CLI if either endpoint was provided; do this
+    // after parsing to avoid order-dependence between --voice-min/--voice-max.
+    if (voiceMinSet || voiceMaxSet)
+    {
+        double useMin = voiceMinSet ? voiceMin : app.getVoiceMinFreq();
+        double useMax = voiceMaxSet ? voiceMax : app.getVoiceMaxFreq();
+        if (useMax > useMin)
+            app.setVoiceRange(useMin, useMax);
+        else
+            juce::Logger::writeToLog("Ignored voice range: max must be > min");
+    }
+
+        if (playFiles)
+        {
+            // split comma-separated list
+            std::vector<juce::String> parts;
+            int start = 0;
+            while (true)
+            {
+                int comma = playFilesList.indexOfChar(',', start);
+                if (comma < 0)
+                {
+                    parts.push_back(playFilesList.substring(start).trim());
+                    break;
+                }
+                parts.push_back(playFilesList.substring(start, comma).trim());
+                start = comma + 1;
+            }
+            app.setPlaybackFiles(parts);
+            app.setFilePlaybackEnabled(true);
+        }
+        else if (playDir)
+        {
+            juce::File dir(playDirPath);
+            if (!dir.exists() || !dir.isDirectory())
+            {
+                juce::Logger::writeToLog("Playback directory not found: " + playDirPath);
+            }
+            else
+            {
+                juce::Array<juce::File> files;
+                dir.findChildFiles(files, juce::File::findFiles, false);
+                std::vector<juce::String> parts;
+                for (auto& f : files)
+                {
+                    auto name = f.getFileName();
+                    if (name.startsWithChar('.'))
+                        continue; // skip hidden files like .DS_Store
+                    juce::String ext = f.getFileExtension().toLowerCase();
+                    if (ext == ".wav" || ext == ".mp3" || ext == ".aiff" || ext == ".aif" || ext == ".flac" || ext == ".ogg" || ext == ".m4a")
+                        parts.push_back(f.getFullPathName());
+                    else
+                        juce::Logger::writeToLog("Skipping non-audio file: " + f.getFullPathName());
+                }
+                if (!parts.empty())
+                {
+                    app.setPlaybackFiles(parts);
+                    app.setFilePlaybackEnabled(true);
+                }
+                else
+                {
+                    juce::Logger::writeToLog("No files found in playback directory: " + playDirPath);
+                }
+            }
+        }
 
     // log active CLI flags so it's obvious what options were used
     juce::String flagLog = "Flags: host=" + host + " port=" + juce::String(port)
@@ -285,15 +449,30 @@ int main (int argc, char* argv[])
     // binRange logging removed
     if (noNoiseFloor)
         flagLog += " noNoiseFloor=1";
+    if (fixedNoiseFloor)
+        flagLog += " fixedNoiseFloor=1";
+    if (shufflePlay)
+        flagLog += " shufflePlay=1";
     if (noiseFloorInitVal >= 0.0)
         flagLog += " noiseFloorInit=" + juce::String(noiseFloorInitVal);
+    if (std::isfinite(baseNoiseFloorDb))
+        flagLog += " baseNoiseFloorDb=" + juce::String(baseNoiseFloorDb);
     juce::Logger::writeToLog(flagLog);
 
     app.start();
 
-    // blocking wait so the app keeps running until Enter (simple and reliable)
-    std::string s;
-    std::getline(std::cin, s);
+    // If stdin is a TTY, block on Enter for interactive use; otherwise
+    // keep the process alive until it's killed (suitable for nohup/daemon runs).
+    if (isatty(fileno(stdin)))
+    {
+        std::string s;
+        std::getline(std::cin, s);
+    }
+    else
+    {
+        while (true)
+            std::this_thread::sleep_for(std::chrono::seconds(60));
+    }
 
     app.stop();
     juce::Logger::writeToLog("Shutting down");

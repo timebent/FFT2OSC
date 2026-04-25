@@ -46,12 +46,18 @@ public:
     // enable/disable per-band noise-floor subtraction
     void setUseNoiseFloor(bool on);
     void setNoiseFloorInit(float initVal);
+    void setNoiseFloorFixed(bool on);
     // (bin-range feature removed)
+
+    // File playback (urn) support: play files one-at-a-time into the FFT input
+    void setPlaybackFiles(const std::vector<juce::String>& paths);
+    void setFilePlaybackEnabled(bool on);
 
 private:
     void timerCallback() override;
     // background sender loop moved out of start() for clarity
     void senderLoop();
+    void logBandCenters();
 
     juce::AudioDeviceManager deviceManager;
     std::unique_ptr<juce::dsp::FFT> fft;
@@ -93,6 +99,9 @@ private:
     float noiseFloorRelease = 0.999f; // how slowly floor rises when louder (closer to 1 = slower)
     float noiseFloorInit = 1e6f;     // initial large floor value
     bool useNoiseFloor = true;
+    // when true, the configured `noiseFloorInit` is used as a fixed floor
+    // and the adaptive attack/release updates are disabled
+    bool noiseFloorFixed = false;
 
     // simple synthetic sender (bypass audio/FFT)
     std::atomic<bool> simpleSendEnabled{false};
@@ -125,6 +134,30 @@ private:
     bool sendOnlyVoice = false;
     double voiceMinFreq = 80.0;   // default human voice lower bound (Hz)
     double voiceMaxFreq = 3000.0; // default upper bound for harmonics (Hz)
+
+private:
+    // internal for file playback
+    juce::AudioFormatManager formatManager;
+    std::vector<juce::File> playbackFiles;
+    std::vector<int> urnIndices; // remaining indices in the current urn
+    bool filePlaybackEnabled = false;
+    std::unique_ptr<juce::AudioFormatReaderSource> readerSource;
+    juce::AudioTransportSource transportSource;
+    double currentFileLengthSeconds = 0.0;
+    int currentFileIndex = -1;
+    std::atomic<bool> nextFileRequested{false};
+    // playback thread to robustly advance files without relying on JUCE Timer
+    std::thread playbackThread;
+    std::atomic<bool> playbackThreadRunning{false};
+    std::mutex playbackMutex;
+    int sequentialIndex = 0; // next index for sequential playback
+    bool shufflePlayback = false;
+
+    // diagnostics: how many full OSC payloads to dump when senderDiag is enabled
+    int payloadDumpRemaining = 5;
+
+public:
+    void setShufflePlayback(bool on) { shufflePlayback = on; juce::Logger::writeToLog(juce::String("Shuffle playback ") + (on ? "enabled" : "disabled")); }
 
     // definitions are in the .cpp file
     

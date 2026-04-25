@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <cstring>
 #include <cmath>
+#include <random>
 
 FFTOSC::FFTOSC()
 {
@@ -44,6 +45,22 @@ FFTOSC::FFTOSC()
     {
         juce::Logger::writeToLog("Debug UDP socket creation failed: " + juce::String(std::strerror(errno)));
     }
+
+    formatManager.registerBasicFormats();
+}
+
+void FFTOSC::logBandCenters()
+{
+    if (outBins <= 0) return;
+    double logRange = (mapMaxFreq > mapMinFreq) ? std::log10(mapMaxFreq / mapMinFreq) : 0.0;
+    juce::String s = "Band centers (Hz):";
+    for (int b = 0; b < outBins; ++b)
+    {
+        double t = (outBins > 1) ? (double)b / (double)(outBins - 1) : 0.0;
+        double targetFreq = mapMinFreq * std::pow(10.0, t * logRange);
+        s += " " + juce::String((double)std::round(targetFreq * 100.0) / 100.0);
+    }
+    juce::Logger::writeToLog(s);
 }
 
 void FFTOSC::senderLoop()
@@ -89,6 +106,20 @@ void FFTOSC::senderLoop()
             {
                 const juce::ScopedLock sl(amplitudesLock);
                 ampsCopy = latestAmplitudes;
+            }
+
+            // If send-only-voice mode is enabled, zero raw FFT bins whose
+            // center frequency lies outside the requested voice/map range.
+            // This ensures downstream aggregation cannot pick up energy from
+            // outside the requested interval.
+            if (sendOnlyVoice && !ampsCopy.empty() && currentSampleRate > 0.0)
+            {
+                for (size_t i = 0; i < ampsCopy.size(); ++i)
+                {
+                    double freq = (double)i * currentSampleRate / (double)fftSize;
+                    if (freq < voiceMinFreq || freq > voiceMaxFreq)
+                        ampsCopy[i] = 0.0f;
+                }
             }
 
             if (ampsCopy.empty())
@@ -215,39 +246,47 @@ void FFTOSC::senderLoop()
             sendBins[i] = v;
         }
 
-        // If requested, zero out bins outside the voice frequency range
-        if (sendOnlyVoice)
-        {
-            double logRange = (mapMaxFreq > mapMinFreq) ? std::log10(mapMaxFreq / mapMinFreq) : 0.0;
-            for (int b = 0; b < (int)sendBins.size(); ++b)
-            {
-                double t = (outBins > 1) ? (double)b / (double)(outBins - 1) : 0.0;
-                double targetFreq = mapMinFreq * std::pow(10.0, t * logRange);
-                if (targetFreq < voiceMinFreq || targetFreq > voiceMaxFreq)
-                    sendBins[(size_t)b] = 0.0f;
-            }
-        }
+        // (Voice-only masking will be applied after normalization so that
+        // noise-floor subtraction and dB normalization cannot re-introduce
+        // energy into bands outside the requested voice range.)
 
-        // initialize noise floor vector to match sendBins size
+        // initialize noise floor vector to match sendBins size; allow fixed-or-adaptive modes
         if (useNoiseFloor)
         {
-            if (noiseFloor.size() != sendBins.size())
-                noiseFloor.assign(sendBins.size(), noiseFloorInit);
-
-            for (size_t i = 0; i < sendBins.size(); ++i)
+            if (noiseFloorFixed)
             {
-                float mag = sendBins[i];
-                if (!std::isfinite(mag)) mag = 0.0f;
-                if (mag < noiseFloor[i])
-                    noiseFloor[i] = noiseFloorAttack * mag + (1.0f - noiseFloorAttack) * noiseFloor[i];
-                else
-                    noiseFloor[i] = noiseFloorRelease * noiseFloor[i] + (1.0f - noiseFloorRelease) * mag;
+                // Fixed floor: subtract the configured init value from every band
+                for (size_t i = 0; i < sendBins.size(); ++i)
+                {
+                    float mag = sendBins[i];
+                    if (!std::isfinite(mag)) mag = 0.0f;
+                    float sub = mag - noiseFloorInit;
+                    if (!std::isfinite(sub) || sub <= 0.0f)
+                        sendBins[i] = 0.0f;
+                    else
+                        sendBins[i] = sub;
+                }
+            }
+            else
+            {
+                if (noiseFloor.size() != sendBins.size())
+                    noiseFloor.assign(sendBins.size(), noiseFloorInit);
 
-                float sub = mag - noiseFloor[i];
-                if (!std::isfinite(sub) || sub <= 0.0f)
-                    sendBins[i] = 0.0f;
-                else
-                    sendBins[i] = sub;
+                for (size_t i = 0; i < sendBins.size(); ++i)
+                {
+                    float mag = sendBins[i];
+                    if (!std::isfinite(mag)) mag = 0.0f;
+                    if (mag < noiseFloor[i])
+                        noiseFloor[i] = noiseFloorAttack * mag + (1.0f - noiseFloorAttack) * noiseFloor[i];
+                    else
+                        noiseFloor[i] = noiseFloorRelease * noiseFloor[i] + (1.0f - noiseFloorRelease) * mag;
+
+                    float sub = mag - noiseFloor[i];
+                    if (!std::isfinite(sub) || sub <= 0.0f)
+                        sendBins[i] = 0.0f;
+                    else
+                        sendBins[i] = sub;
+                }
             }
         }
 
@@ -282,6 +321,19 @@ void FFTOSC::senderLoop()
             if (norm > 1.0f) norm = 1.0f;
             sendBins[i] = norm;
         }
+        // Enforce voice-only masking after normalization so that no subsequent
+        // processing can re-introduce energy into bins outside the voice range.
+        if (sendOnlyVoice)
+        {
+            double logRange = (mapMaxFreq > mapMinFreq) ? std::log10(mapMaxFreq / mapMinFreq) : 0.0;
+            for (int b = 0; b < (int)sendBins.size(); ++b)
+            {
+                double t = (outBins > 1) ? (double)b / (double)(outBins - 1) : 0.0;
+                double targetFreq = mapMinFreq * std::pow(10.0, t * logRange);
+                if (targetFreq < voiceMinFreq || targetFreq > voiceMaxFreq)
+                    sendBins[(size_t)b] = 0.0f;
+            }
+        }
         if (sendLogLimit > 0)
         {
             juce::String normS = "norm[0..7]: ";
@@ -289,6 +341,15 @@ void FFTOSC::senderLoop()
                 normS += juce::String(sendBins[(size_t)i]) + " ";
             juce::Logger::writeToLog(normS);
             --sendLogLimit;
+        }
+
+        // Brief amplitude logging when diagnostics are enabled
+        if (senderDiag)
+        {
+            juce::String ampS = "AMP[0..7]: ";
+            for (int i = 0; i < 8 && i < (int)sendBins.size(); ++i)
+                ampS += juce::String(sendBins[(size_t)i]) + " ";
+            juce::Logger::writeToLog(ampS);
         }
 
         // Ensure we always send exactly outBins floats (pad with 0.0 or truncate)
@@ -309,6 +370,18 @@ void FFTOSC::senderLoop()
         {
             std::lock_guard<std::mutex> lock(sendMutex);
             ok = oscSender.send(msg);
+        }
+        // when diagnostics enabled, optionally dump the full float payload for a few sends
+        if (senderDiag && payloadDumpRemaining > 0)
+        {
+            juce::String payload = "FULL_PAYLOAD: ";
+            for (size_t i = 0; i < sendBins.size(); ++i)
+            {
+                payload += juce::String(sendBins[i]);
+                if (i + 1 < sendBins.size()) payload += ", ";
+            }
+            juce::Logger::writeToLog(payload);
+            --payloadDumpRemaining;
         }
         // diagnostic logging: timestamp each send when enabled
         if (senderDiag)
@@ -378,6 +451,7 @@ FFTOSC::FFTOSC(const juce::String& host, int port)
     {
         juce::Logger::writeToLog("Debug UDP socket creation failed: " + juce::String(std::strerror(errno)));
     }
+    formatManager.registerBasicFormats();
 }
 
 void FFTOSC::setTestTone(bool enabled, float freqHz)
@@ -387,6 +461,38 @@ void FFTOSC::setTestTone(bool enabled, float freqHz)
         testFreqHz = freqHz;
     juce::Logger::writeToLog("Test tone " + juce::String(enabled ? "enabled" : "disabled") + 
                              " freq=" + juce::String(testFreqHz));
+}
+
+void FFTOSC::setPlaybackFiles(const std::vector<juce::String>& paths)
+{
+    playbackFiles.clear();
+    for (auto& p : paths)
+    {
+        juce::File f(p);
+        if (f.existsAsFile())
+            playbackFiles.push_back(f);
+        else
+            juce::Logger::writeToLog("Playback file not found: " + p);
+    }
+    // reset urn so nextFileRequested will trigger fresh selection
+    urnIndices.clear();
+    sequentialIndex = 0;
+    nextFileRequested.store(!playbackFiles.empty());
+}
+
+void FFTOSC::setFilePlaybackEnabled(bool on)
+{
+    filePlaybackEnabled = on;
+    if (!on)
+    {
+        transportSource.stop();
+        readerSource.reset();
+    }
+    else
+    {
+        nextFileRequested.store(!playbackFiles.empty());
+    }
+    juce::Logger::writeToLog(juce::String("File playback ") + (on ? "enabled" : "disabled"));
 }
 
 void FFTOSC::setSimpleSend(bool enabled, int bandIndex)
@@ -441,6 +547,14 @@ void FFTOSC::setNoiseFloorInit(float initVal)
         std::fill(noiseFloor.begin(), noiseFloor.end(), noiseFloorInit);
 }
 
+void FFTOSC::setNoiseFloorFixed(bool on)
+{
+    noiseFloorFixed = on;
+    juce::Logger::writeToLog(juce::String("Noise floor fixed mode ") + (on ? "enabled" : "disabled"));
+    if (on)
+        noiseFloor.clear();
+}
+
 // bin-range feature removed
 
 bool FFTOSC::getUseRMSAggregation() const
@@ -486,14 +600,15 @@ void FFTOSC::start()
     if (!simpleSendEnabled.load())
     {
         // If a test tone is enabled, request both input and outputs so mic+tone work together
+        int numInputs = 1;
+        int numOutputs = 0;
         if (testToneEnabled.load())
-        {
-            deviceManager.initialiseWithDefaultDevices(1, 2);
-        }
-        else
-        {
-            deviceManager.initialiseWithDefaultDevices(1, 0);
-        }
+            numOutputs = 2;
+        // If file playback is enabled we need output channels so the audio callback
+        // runs and `transportSource.getNextAudioBlock()` is called to advance files.
+        if (filePlaybackEnabled)
+            numOutputs = std::max(numOutputs, 2);
+        deviceManager.initialiseWithDefaultDevices(numInputs, numOutputs);
         deviceManager.addAudioCallback(this);
     }
         else
@@ -504,6 +619,104 @@ void FFTOSC::start()
     // start background sender thread
     senderRunning.store(true);
     senderThread = std::thread(&FFTOSC::senderLoop, this);
+    // start the message-thread timer for periodic tasks (urn/file playback)
+    startTimer(50); // 50 ms interval
+    // print band centers so user can see which visual bins map to which frequencies
+    logBandCenters();
+    // If file playback was enabled before start, try to kick off the first file immediately
+    if (filePlaybackEnabled && !playbackFiles.empty())
+    {
+        // try each file until one successfully opens
+        bool openedAny = false;
+        for (int idx = 0; idx < (int)playbackFiles.size(); ++idx)
+        {
+            juce::File f = playbackFiles[(size_t)idx];
+            std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(f));
+            if (reader)
+            {
+                currentFileIndex = idx;
+                readerSource.reset(new juce::AudioFormatReaderSource(reader.release(), true));
+                transportSource.setSource(readerSource.get(), 0, nullptr, readerSource->getAudioFormatReader()->sampleRate);
+                transportSource.start();
+                juce::Logger::writeToLog("Started playback: " + f.getFullPathName());
+                openedAny = true;
+                break;
+            }
+            else
+            {
+                juce::Logger::writeToLog("Failed to open playback file: " + f.getFullPathName());
+            }
+        }
+        if (openedAny)
+        {
+            // clear any pending automatic request so timerCallback doesn't immediately open
+            nextFileRequested.store(false);
+        }
+    }
+    // start playback thread to monitor transport and advance files
+    playbackThreadRunning.store(true);
+    playbackThread = std::thread([this]() {
+        while (playbackThreadRunning.load())
+        {
+            if (filePlaybackEnabled && readerSource != nullptr)
+            {
+                double pos = transportSource.getCurrentPosition();
+                double len = transportSource.getLengthInSeconds();
+                bool playing = transportSource.isPlaying();
+                if (len > 0.0 && !playing && pos >= (len - 0.05) && pos > 0.01)
+                {
+                    juce::Logger::writeToLog("playbackThread: detected EOF pos=" + juce::String(pos) + " len=" + juce::String(len));
+                    // start next file under playbackMutex to avoid races
+                    std::lock_guard<std::mutex> lg(playbackMutex);
+                    if (!playbackFiles.empty())
+                    {
+                        int idx = 0;
+                        if (shufflePlayback)
+                        {
+                            if (urnIndices.empty())
+                            {
+                                urnIndices.reserve((int)playbackFiles.size());
+                                for (int i = 0; i < (int)playbackFiles.size(); ++i)
+                                    urnIndices.push_back(i);
+                                std::random_device rd;
+                                std::mt19937 g(rd());
+                                std::shuffle(urnIndices.begin(), urnIndices.end(), g);
+                            }
+                            if (currentFileIndex >= 0 && urnIndices.size() > 1)
+                                urnIndices.erase(std::remove(urnIndices.begin(), urnIndices.end(), currentFileIndex), urnIndices.end());
+                            idx = urnIndices.back();
+                            urnIndices.pop_back();
+                        }
+                        else
+                        {
+                            if (sequentialIndex < 0) sequentialIndex = 0;
+                            if (sequentialIndex >= (int)playbackFiles.size()) sequentialIndex = 0;
+                            idx = sequentialIndex;
+                            sequentialIndex = (sequentialIndex + 1) % (int)playbackFiles.size();
+                        }
+                        juce::File f = playbackFiles[(size_t)idx];
+                        std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(f));
+                        if (reader)
+                        {
+                            transportSource.stop();
+                            transportSource.setSource(nullptr);
+                            readerSource.reset(new juce::AudioFormatReaderSource(reader.release(), true));
+                            currentFileLengthSeconds = (double)readerSource->getTotalLength() / readerSource->getAudioFormatReader()->sampleRate;
+                            transportSource.setSource(readerSource.get(), 0, nullptr, readerSource->getAudioFormatReader()->sampleRate);
+                            transportSource.start();
+                            currentFileIndex = idx;
+                            juce::Logger::writeToLog("playbackThread: Started playback: " + f.getFullPathName());
+                        }
+                        else
+                        {
+                            juce::Logger::writeToLog("playbackThread: Failed to open playback file: " + f.getFullPathName());
+                        }
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
 }
 
 void FFTOSC::stop()
@@ -512,6 +725,14 @@ void FFTOSC::stop()
     senderRunning.store(false);
     if (senderThread.joinable())
         senderThread.join();
+
+    // stop the timer
+    stopTimer();
+
+    // stop playback thread
+    playbackThreadRunning.store(false);
+    if (playbackThread.joinable())
+        playbackThread.join();
 
     deviceManager.removeAudioCallback(this);
     deviceManager.closeAudioDevice();
@@ -527,21 +748,47 @@ void FFTOSC::audioDeviceAboutToStart (juce::AudioIODevice* device)
         s += " inputs=" + juce::String(device->getActiveInputChannels().countNumberOfSetBits());
         juce::Logger::writeToLog(s);
     }
+
+    // prepare transportSource if file playback is enabled
+    transportSource.prepareToPlay(512, currentSampleRate);
 }
 
 void FFTOSC::audioDeviceStopped()
 {
     juce::Logger::writeToLog("Audio device stopped");
+    transportSource.stop();
+    transportSource.releaseResources();
 }
 
 void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelData, int numInputChannels, float* const* outputChannelData, int numOutputChannels, int numSamples, const juce::AudioIODeviceCallbackContext& context)
 {
     // Mix input channels to mono and push into FIFO
+    juce::AudioBuffer<float> tmpBuf;
+    juce::AudioSourceChannelInfo tmpInfo;
+    bool havePlaybackBuf = false;
+    if (filePlaybackEnabled)
+    {
+        tmpBuf.setSize(2, numSamples);
+        tmpInfo = juce::AudioSourceChannelInfo(&tmpBuf, 0, numSamples);
+        transportSource.getNextAudioBlock(tmpInfo);
+        havePlaybackBuf = true;
+    }
+
     for (int i = 0; i < numSamples; ++i)
     {
         float sample = 0.0f;
 
-        if (testToneEnabled.load())
+        if (filePlaybackEnabled && havePlaybackBuf)
+        {
+            // mix channels for this sample index
+            float s = 0.0f;
+            int chans = tmpBuf.getNumChannels();
+            for (int ch = 0; ch < chans; ++ch)
+                s += tmpBuf.getSample(ch, i);
+            if (chans > 0) s /= (float)chans;
+            sample = s;
+        }
+        else if (testToneEnabled.load())
         {
             // generate sine test tone
             double inc = 2.0 * M_PI * (double)testFreqHz / currentSampleRate;
@@ -621,6 +868,27 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
             fifoIndex = 0;
         }
     }
+
+    // occasional diagnostic for playback state (not every callback)
+    static int playbackDiagCounter = 0;
+    if ((++playbackDiagCounter % 500) == 0 && filePlaybackEnabled)
+    {
+        juce::Logger::writeToLog("audio callback diag: numOutputChannels=" + juce::String(numOutputChannels)
+                                  + " transportPlaying=" + juce::String(transportSource.isPlaying() ? "yes" : "no")
+                                  + " pos=" + juce::String(transportSource.getCurrentPosition())
+                                  + " len=" + juce::String(transportSource.getLengthInSeconds()) );
+    }
+    // If the transport has stopped but position indicates end-of-file, request next file.
+    if (filePlaybackEnabled)
+    {
+        double pos = transportSource.getCurrentPosition();
+        double len = transportSource.getLengthInSeconds();
+        if (len > 0.0 && !transportSource.isPlaying() && pos >= (len - 0.05) && pos > 0.01)
+        {
+            juce::Logger::writeToLog("audio callback: detected EOF pos=" + juce::String(pos) + " len=" + juce::String(len) + ", requesting next file");
+            nextFileRequested.store(true);
+        }
+    }
 }
 
 void FFTOSC::timerCallback()
@@ -640,6 +908,73 @@ void FFTOSC::timerCallback()
         if (++sendCounter % 30 == 0)
             juce::Logger::writeToLog("No FFT amplitudes available yet");
         return;
+    }
+    // handle any requested next-file events from audio thread
+    if (nextFileRequested.exchange(false))
+    {
+        juce::Logger::writeToLog("timerCallback: nextFileRequested observed");
+        if (filePlaybackEnabled && !playbackFiles.empty())
+        {
+            // choose next file from urn and start it
+            int idx = 0;
+            if (shufflePlayback)
+            {
+                if (urnIndices.empty())
+                {
+                    urnIndices.reserve((int)playbackFiles.size());
+                    for (int i = 0; i < (int)playbackFiles.size(); ++i)
+                        urnIndices.push_back(i);
+                    std::random_device rd;
+                    std::mt19937 g(rd());
+                    std::shuffle(urnIndices.begin(), urnIndices.end(), g);
+                }
+                // avoid reselecting currently playing file if possible
+                if (currentFileIndex >= 0 && urnIndices.size() > 1)
+                    urnIndices.erase(std::remove(urnIndices.begin(), urnIndices.end(), currentFileIndex), urnIndices.end());
+                idx = urnIndices.back();
+                urnIndices.pop_back();
+            }
+            else
+            {
+                if (sequentialIndex < 0) sequentialIndex = 0;
+                if (sequentialIndex >= (int)playbackFiles.size()) sequentialIndex = 0;
+                idx = sequentialIndex;
+                sequentialIndex = (sequentialIndex + 1) % (int)playbackFiles.size();
+            }
+            currentFileIndex = idx;
+            juce::File f = playbackFiles[(size_t)idx];
+            std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(f));
+            if (reader)
+            {
+                // stop and clear previous source before swapping
+                transportSource.stop();
+                transportSource.setSource(nullptr);
+                readerSource.reset(new juce::AudioFormatReaderSource(reader.release(), true));
+                currentFileLengthSeconds = (double)readerSource->getTotalLength() / readerSource->getAudioFormatReader()->sampleRate;
+                transportSource.setSource(readerSource.get(), 0, nullptr, readerSource->getAudioFormatReader()->sampleRate);
+                transportSource.start();
+                juce::Logger::writeToLog("Started playback: " + f.getFullPathName() + " seqIndex=" + juce::String(sequentialIndex));
+            }
+            else
+            {
+                juce::Logger::writeToLog("Failed to open playback file: " + f.getFullPathName());
+            }
+        }
+    }
+    // If file playback is enabled and the transport stopped (file ended), schedule next
+    if (filePlaybackEnabled && readerSource != nullptr)
+    {
+        // consider playback finished either when transport reports stopped or we've reached the end
+        bool finished = !transportSource.isPlaying();
+        double pos = transportSource.getCurrentPosition();
+        double len = transportSource.getLengthInSeconds();
+        if (len > 0.0 && pos >= (len - 0.05))
+            finished = true;
+        if (finished)
+        {
+            juce::Logger::writeToLog("Playback finished for index=" + juce::String(currentFileIndex) + ", scheduling next file");
+            nextFileRequested.store(true);
+        }
     }
     // Sending is now handled by the sender thread; timerCallback will not transmit OSC.
 }
