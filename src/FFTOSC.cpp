@@ -46,6 +46,301 @@ FFTOSC::FFTOSC()
     }
 }
 
+void FFTOSC::senderLoop()
+{
+    while (senderRunning.load())
+    {
+        // copy latest amplitudes or generate synthetic bins when in simple-send mode
+        std::vector<float> sendBins;
+        sendBins.reserve(outBins);
+        float globalMax = 0.0f;
+        int globalMaxIndex = 0;
+        int nonZeroCount = 0;
+        int expectedBin = -1;
+
+        if (simpleSendEnabled.load())
+        {
+            // generate synthetic band array: single active band (or sweep if band out of range)
+            sendBins.assign(outBins, 0.0f);
+            int band = simpleSendBand.load();
+            if (band < 0 || band >= outBins)
+            {
+                int b = (int)std::floor(simpleSweepPos) % outBins;
+                sendBins[b] = 1.0f;
+                simpleSweepPos += 1.0;
+                if (simpleSweepPos >= outBins) simpleSweepPos -= outBins;
+                globalMax = 1.0f;
+                globalMaxIndex = b;
+                nonZeroCount = 1;
+            }
+            else
+            {
+                sendBins[band] = 1.0f;
+                globalMax = 1.0f;
+                globalMaxIndex = band;
+                nonZeroCount = 1;
+            }
+            // no FFT inputs, expectedBin is N/A here (we're sending bands directly)
+        }
+        else
+        {
+            // copy latest amplitudes
+            std::vector<float> ampsCopy;
+            {
+                const juce::ScopedLock sl(amplitudesLock);
+                ampsCopy = latestAmplitudes;
+            }
+
+            if (ampsCopy.empty())
+            {
+                // no FFT yet; wait a short time and retry so we can send immediately once available
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            // downsample to outBins using logarithmic (geometric) banding
+            size_t total = ampsCopy.size();
+            if (total == 0)
+                continue;
+
+            {
+                // build log-spaced edges from 0..total OR perform fractional-bin interpolation
+                std::vector<int> edges;
+                edges.reserve(outBins + 1);
+                double logMin = std::log(1.0);
+                double logMax = std::log((double)total);
+                if (!interpMode)
+                {
+                    edges.push_back(0);
+                    for (int k = 1; k < outBins; ++k)
+                    {
+                        double t = (double)k / (double)outBins;
+                        int idx = (int)std::floor(std::exp(logMin + (logMax - logMin) * t));
+                        if (idx < 1) idx = 1;
+                        if (idx > (int)total - 1) idx = (int)total - 1;
+                        edges.push_back(idx);
+                    }
+                    edges.push_back((int)total);
+                }
+
+                // compute global peak and count of non-zero bins (before downsampling)
+                const float zeroEps = 1e-9f;
+                for (size_t i = 0; i < total; ++i)
+                {
+                    float v = ampsCopy[i];
+                    if (std::isfinite(v) && v > globalMax)
+                    {
+                        globalMax = v;
+                        globalMaxIndex = (int)i;
+                    }
+                    if (std::isfinite(v) && v > zeroEps)
+                        ++nonZeroCount;
+                }
+
+                if (!interpMode)
+                {
+                    // Aggregate FFT bins into output visual bands.
+                    for (int b = 0; b < outBins; ++b)
+                    {
+                        int start = edges[b];
+                        int end = edges[b+1];
+                        if (start >= (int)total) { sendBins.push_back(0.0f); continue; }
+                        end = std::min(end, (int)total);
+                        int count = end - start;
+                        if (count <= 0)
+                        {
+                            sendBins.push_back(0.0f);
+                            continue;
+                        }
+                        double sumSq = 0.0;
+                        for (int i = start; i < end; ++i)
+                        {
+                            float v = ampsCopy[(size_t)i];
+                            if (!std::isfinite(v) || v <= 0.0f)
+                                v = 0.0f;
+                            sumSq += (double)v * (double)v;
+                        }
+                        double meanSq = sumSq / (double)count;
+                        float rms = (float)std::sqrt(meanSq);
+                        sendBins.push_back(rms);
+                    }
+                }
+                else
+                {
+                    double logRange = std::log10(mapMaxFreq / mapMinFreq);
+                    for (int b = 0; b < outBins; ++b)
+                    {
+                        double t = (outBins > 1) ? (double)b / (double)(outBins - 1) : 0.0;
+                        double targetFreq = mapMinFreq * std::pow(10.0, t * logRange);
+                        double binFloat = targetFreq * (double)fftSize / currentSampleRate;
+                        int i0 = (int)std::floor(binFloat);
+                        if (i0 < 0) i0 = 0;
+                        if (i0 > (int)total - 1) i0 = (int)total - 1;
+                        int i1 = std::min(i0 + 1, (int)total - 1);
+                        float v0 = ampsCopy[(size_t)i0];
+                        float v1 = ampsCopy[(size_t)i1];
+                        double frac = binFloat - std::floor(binFloat);
+                        if (!std::isfinite(v0)) v0 = 0.0f;
+                        if (!std::isfinite(v1)) v1 = 0.0f;
+                        float interp = (float)(v0 + frac * (v1 - v0));
+                        sendBins.push_back(interp);
+                    }
+                }
+
+                if (testToneEnabled.load() && currentSampleRate > 0.0)
+                {
+                    expectedBin = (int)std::lround((double)testFreqHz * (double)fftSize / currentSampleRate);
+                }
+            }
+
+        }
+
+        // sanitize and scale magnitudes, then convert to dB and normalize to 0..1
+        const float eps = 1e-12f;
+        const float minDb = -80.0f;
+        const float maxDb = 0.0f;
+        const float maxReasonable = 1e12f; // clamp extreme values
+        const float scale = (fftSize > 0) ? (1.0f / (float) fftSize) : 1.0f;
+
+        for (size_t i = 0; i < sendBins.size(); ++i)
+        {
+            float v = sendBins[i];
+            if (!std::isfinite(v))
+                v = 0.0f;
+            if (v < 0.0f)
+                v = 0.0f;
+            if (v > maxReasonable)
+                v = maxReasonable;
+            v *= scale;
+            sendBins[i] = v;
+        }
+
+        // If requested, zero out bins outside the voice frequency range
+        if (sendOnlyVoice)
+        {
+            double logRange = (mapMaxFreq > mapMinFreq) ? std::log10(mapMaxFreq / mapMinFreq) : 0.0;
+            for (int b = 0; b < (int)sendBins.size(); ++b)
+            {
+                double t = (outBins > 1) ? (double)b / (double)(outBins - 1) : 0.0;
+                double targetFreq = mapMinFreq * std::pow(10.0, t * logRange);
+                if (targetFreq < voiceMinFreq || targetFreq > voiceMaxFreq)
+                    sendBins[(size_t)b] = 0.0f;
+            }
+        }
+
+        // initialize noise floor vector to match sendBins size
+        if (useNoiseFloor)
+        {
+            if (noiseFloor.size() != sendBins.size())
+                noiseFloor.assign(sendBins.size(), noiseFloorInit);
+
+            for (size_t i = 0; i < sendBins.size(); ++i)
+            {
+                float mag = sendBins[i];
+                if (!std::isfinite(mag)) mag = 0.0f;
+                if (mag < noiseFloor[i])
+                    noiseFloor[i] = noiseFloorAttack * mag + (1.0f - noiseFloorAttack) * noiseFloor[i];
+                else
+                    noiseFloor[i] = noiseFloorRelease * noiseFloor[i] + (1.0f - noiseFloorRelease) * mag;
+
+                float sub = mag - noiseFloor[i];
+                if (!std::isfinite(sub) || sub <= 0.0f)
+                    sendBins[i] = 0.0f;
+                else
+                    sendBins[i] = sub;
+            }
+        }
+
+        if (sendLogLimit > 0)
+        {
+            juce::String rawS = "raw[0..7]: ";
+            for (int i = 0; i < 8 && i < (int)sendBins.size(); ++i)
+                rawS += juce::String(sendBins[(size_t)i]) + " ";
+            rawS += " | globalMax=" + juce::String(globalMax) + " idx=" + juce::String(globalMaxIndex) + " nonZero=" + juce::String(nonZeroCount);
+            if (expectedBin >= 0)
+                rawS += " expectedBin=" + juce::String(expectedBin);
+            if (testToneEnabled.load())
+            {
+                double logRange10 = std::log10(mapMaxFreq / mapMinFreq);
+                double tvis = 0.0;
+                if (testFreqHz > 0.0 && logRange10 > 0.0)
+                    tvis = std::log10((double)testFreqHz / mapMinFreq) / logRange10;
+                int expectedVis = (int)std::lround(tvis * (double)(outBins - 1));
+                if (expectedVis < 0) expectedVis = 0;
+                if (expectedVis > outBins - 1) expectedVis = outBins - 1;
+                rawS += " expectedVis=" + juce::String(expectedVis);
+            }
+            juce::Logger::writeToLog(rawS);
+        }
+        for (size_t i = 0; i < sendBins.size(); ++i)
+        {
+            float mag = sendBins[i];
+            float db = 20.0f * std::log10f(mag + eps);
+            float norm = (db - minDb) / (maxDb - minDb);
+            if (!std::isfinite(norm)) norm = 0.0f;
+            if (norm < 0.0f) norm = 0.0f;
+            if (norm > 1.0f) norm = 1.0f;
+            sendBins[i] = norm;
+        }
+        if (sendLogLimit > 0)
+        {
+            juce::String normS = "norm[0..7]: ";
+            for (int i = 0; i < 8 && i < (int)sendBins.size(); ++i)
+                normS += juce::String(sendBins[(size_t)i]) + " ";
+            juce::Logger::writeToLog(normS);
+            --sendLogLimit;
+        }
+
+        // Ensure we always send exactly outBins floats (pad with 0.0 or truncate)
+        if ((int)sendBins.size() < outBins)
+        {
+            sendBins.resize(outBins, 0.0f);
+        }
+        else if ((int)sendBins.size() > outBins)
+        {
+            sendBins.resize(outBins);
+        }
+
+        // send using JUCE OSCMessage (ensures proper OSC formatting)
+        juce::OSCMessage msg("/fft/amplitudes");
+        for (size_t i = 0; i < sendBins.size(); ++i)
+            msg.addFloat32(sendBins[i]);
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lock(sendMutex);
+            ok = oscSender.send(msg);
+        }
+        // diagnostic logging: timestamp each send when enabled
+        if (senderDiag)
+        {
+            auto now = std::chrono::steady_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+            int cnt = ++senderDiagCount;
+            juce::Logger::writeToLog("SEND ts_ms=" + juce::String((long long)ms) + " cnt=" + juce::String(cnt));
+        }
+        if (!ok)
+            juce::Logger::writeToLog("OSC send failed (oscSender)");
+        else if (sendLogLimit > 0)
+        {
+            juce::String s = "Sent /fft/amplitudes count=" + juce::String(outBins) + " first=" + juce::String(sendBins[0]) + " (verbose)";
+            juce::Logger::writeToLog(s);
+            --sendLogLimit;
+        }
+        // Periodic runtime confirmation for test tone
+        if (testToneEnabled.load())
+        {
+            testToneLogCounter += senderIntervalMs;
+            if (testToneLogCounter >= testToneLogIntervalMs)
+            {
+                juce::Logger::writeToLog("Test tone active freq=" + juce::String(testFreqHz));
+                testToneLogCounter = 0;
+            }
+        }
+        // sleep after sending so the first valid FFT is sent immediately
+        std::this_thread::sleep_for(std::chrono::milliseconds(senderIntervalMs));
+    }
+}
+
 FFTOSC::FFTOSC(const juce::String& host, int port)
     : oscHost(host), oscPort(port)
 {
@@ -107,6 +402,52 @@ void FFTOSC::setInterpMode(bool enabled)
     juce::Logger::writeToLog("Interpolation mode " + juce::String(enabled ? "enabled" : "disabled"));
 }
 
+void FFTOSC::setSenderIntervalMs(int ms)
+{
+    if (ms > 0)
+    {
+        senderIntervalMs = ms;
+        juce::Logger::writeToLog("Sender interval set to " + juce::String(senderIntervalMs) + " ms");
+    }
+}
+
+void FFTOSC::setSenderDiagnostic(bool on)
+{
+    senderDiag = on;
+    senderDiagCount.store(0);
+    juce::Logger::writeToLog(juce::String("Sender diagnostic ") + (on ? "enabled" : "disabled"));
+}
+
+void FFTOSC::setUseRMSAggregation(bool on)
+{
+    useRMSAggregation = on;
+    juce::Logger::writeToLog(juce::String("RMS aggregation ") + (on ? "enabled" : "disabled"));
+}
+
+void FFTOSC::setUseNoiseFloor(bool on)
+{
+    useNoiseFloor = on;
+    juce::Logger::writeToLog(juce::String("Noise floor ") + (on ? "enabled" : "disabled"));
+    if (!useNoiseFloor)
+        noiseFloor.clear();
+}
+
+void FFTOSC::setNoiseFloorInit(float initVal)
+{
+    noiseFloorInit = initVal;
+    juce::Logger::writeToLog("Noise floor init set to " + juce::String(noiseFloorInit));
+    // if floor vector exists, reinit
+    if (!noiseFloor.empty())
+        std::fill(noiseFloor.begin(), noiseFloor.end(), noiseFloorInit);
+}
+
+// bin-range feature removed
+
+bool FFTOSC::getUseRMSAggregation() const
+{
+    return useRMSAggregation;
+}
+
 void FFTOSC::setMapFreqRange(double minFreq, double maxFreq)
 {
     if (minFreq > 0 && maxFreq > minFreq)
@@ -144,279 +485,25 @@ void FFTOSC::start()
 {
     if (!simpleSendEnabled.load())
     {
-        deviceManager.initialiseWithDefaultDevices(1, 0);
+        // If a test tone is enabled, request both input and outputs so mic+tone work together
+        if (testToneEnabled.load())
+        {
+            deviceManager.initialiseWithDefaultDevices(1, 2);
+        }
+        else
+        {
+            deviceManager.initialiseWithDefaultDevices(1, 0);
+        }
         deviceManager.addAudioCallback(this);
     }
-    else
-    {
-        juce::Logger::writeToLog("Simple sender enabled: skipping audio device init");
-    }
+        else
+        {
+            juce::Logger::writeToLog("Simple sender enabled: skipping audio device init");
+        }
 
     // start background sender thread
     senderRunning.store(true);
-    senderThread = std::thread([this]() {
-        while (senderRunning.load())
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(senderIntervalMs));
-
-            // copy latest amplitudes or generate synthetic bins when in simple-send mode
-            std::vector<float> sendBins;
-            sendBins.reserve(outBins);
-            float globalMax = 0.0f;
-            int globalMaxIndex = 0;
-            int nonZeroCount = 0;
-            int expectedBin = -1;
-
-            if (simpleSendEnabled.load())
-            {
-                // generate synthetic band array: single active band (or sweep if band out of range)
-                sendBins.assign(outBins, 0.0f);
-                int band = simpleSendBand.load();
-                if (band < 0 || band >= outBins)
-                {
-                    int b = (int)std::floor(simpleSweepPos) % outBins;
-                    sendBins[b] = 1.0f;
-                    simpleSweepPos += 1.0;
-                    if (simpleSweepPos >= outBins) simpleSweepPos -= outBins;
-                    globalMax = 1.0f;
-                    globalMaxIndex = b;
-                    nonZeroCount = 1;
-                }
-                else
-                {
-                    sendBins[band] = 1.0f;
-                    globalMax = 1.0f;
-                    globalMaxIndex = band;
-                    nonZeroCount = 1;
-                }
-                // no FFT inputs, expectedBin is N/A here (we're sending bands directly)
-            }
-            else
-            {
-                // copy latest amplitudes
-                std::vector<float> ampsCopy;
-                {
-                    const juce::ScopedLock sl(amplitudesLock);
-                    ampsCopy = latestAmplitudes;
-                }
-
-                if (ampsCopy.empty())
-                    continue;
-
-                // downsample to outBins using logarithmic (geometric) banding
-                size_t total = ampsCopy.size();
-                if (total == 0)
-                    continue;
-
-            // build log-spaced edges from 0..total OR perform fractional-bin interpolation
-            std::vector<int> edges;
-            edges.reserve(outBins + 1);
-            double logMin = std::log(1.0);
-            double logMax = std::log((double)total);
-            if (!interpMode)
-            {
-                edges.push_back(0);
-                for (int k = 1; k < outBins; ++k)
-                {
-                    double t = (double)k / (double)outBins;
-                    int idx = (int)std::floor(std::exp(logMin + (logMax - logMin) * t));
-                    if (idx < 1) idx = 1;
-                    if (idx > (int)total - 1) idx = (int)total - 1;
-                    edges.push_back(idx);
-                }
-                edges.push_back((int)total);
-            }
-
-                // compute global peak and count of non-zero bins (before downsampling)
-                const float zeroEps = 1e-9f;
-                for (size_t i = 0; i < total; ++i)
-                {
-                    float v = ampsCopy[i];
-                    if (std::isfinite(v) && v > globalMax)
-                    {
-                        globalMax = v;
-                        globalMaxIndex = (int)i;
-                    }
-                    if (std::isfinite(v) && v > zeroEps)
-                        ++nonZeroCount;
-                }
-
-                if (!interpMode)
-                {
-                    for (int b = 0; b < outBins; ++b)
-                    {
-                        int start = edges[b];
-                        int end = edges[b+1];
-                        if (start >= (int)total) { sendBins.push_back(0.0f); continue; }
-                        end = std::min(end, (int)total);
-                        float m = 0.0f;
-                        for (int i = start; i < end; ++i)
-                        {
-                            float v = ampsCopy[(size_t)i];
-                            if (std::isfinite(v) && v > m) m = v;
-                        }
-                        sendBins.push_back(m);
-                    }
-                }
-                else
-                {
-                    // fractional-bin interpolation per visual output index (log-frequency mapping)
-                    double logRange = std::log10(mapMaxFreq / mapMinFreq);
-                    for (int b = 0; b < outBins; ++b)
-                    {
-                        double t = (outBins > 1) ? (double)b / (double)(outBins - 1) : 0.0;
-                        double targetFreq = mapMinFreq * std::pow(10.0, t * logRange);
-                        // map frequency to FFT bin index: use full fftSize (not half-length 'total')
-                        double binFloat = targetFreq * (double)fftSize / currentSampleRate;
-                        int i0 = (int)std::floor(binFloat);
-                        if (i0 < 0) i0 = 0;
-                        if (i0 > (int)total - 1) i0 = (int)total - 1;
-                        int i1 = std::min(i0 + 1, (int)total - 1);
-                        float v0 = ampsCopy[(size_t)i0];
-                        float v1 = ampsCopy[(size_t)i1];
-                        double frac = binFloat - std::floor(binFloat);
-                        if (!std::isfinite(v0)) v0 = 0.0f;
-                        if (!std::isfinite(v1)) v1 = 0.0f;
-                        float interp = (float)(v0 + frac * (v1 - v0));
-                        sendBins.push_back(interp);
-                    }
-                }
-
-                // If test tone is enabled, compute expected bin for the tone
-                if (testToneEnabled.load() && currentSampleRate > 0.0)
-                {
-                    expectedBin = (int)std::lround((double)testFreqHz * (double)fftSize / currentSampleRate);
-                }
-            }
-
-            // sanitize and scale magnitudes, then convert to dB and normalize to 0..1
-            // scale by fftSize to bring FFT output into a sane amplitude range
-            const float eps = 1e-12f;
-            const float minDb = -80.0f;
-            const float maxDb = 0.0f;
-            const float maxReasonable = 1e12f; // clamp extreme values
-            const float scale = (fftSize > 0) ? (1.0f / (float) fftSize) : 1.0f;
-
-            for (size_t i = 0; i < sendBins.size(); ++i)
-            {
-                float v = sendBins[i];
-                if (!std::isfinite(v))
-                    v = 0.0f;
-                if (v < 0.0f)
-                    v = 0.0f;
-                if (v > maxReasonable)
-                    v = maxReasonable;
-                v *= scale;
-                sendBins[i] = v;
-            }
-
-            // If requested, zero out bins outside the voice frequency range
-            if (sendOnlyVoice)
-            {
-                double logRange = (mapMaxFreq > mapMinFreq) ? std::log10(mapMaxFreq / mapMinFreq) : 0.0;
-                for (int b = 0; b < (int)sendBins.size(); ++b)
-                {
-                    double t = (outBins > 1) ? (double)b / (double)(outBins - 1) : 0.0;
-                    double targetFreq = mapMinFreq * std::pow(10.0, t * logRange);
-                    if (targetFreq < voiceMinFreq || targetFreq > voiceMaxFreq)
-                        sendBins[(size_t)b] = 0.0f;
-                }
-            }
-
-            // initialize noise floor vector to match sendBins size
-            if (useNoiseFloor)
-            {
-                if (noiseFloor.size() != sendBins.size())
-                    noiseFloor.assign(sendBins.size(), noiseFloorInit);
-
-                // apply attack/release smoothing to noise floor and subtract
-                for (size_t i = 0; i < sendBins.size(); ++i)
-                {
-                    float mag = sendBins[i];
-                    if (!std::isfinite(mag)) mag = 0.0f;
-                    // update floor: drop quickly when mag < floor (attack), rise slowly when mag > floor (release)
-                    if (mag < noiseFloor[i])
-                        noiseFloor[i] = noiseFloorAttack * mag + (1.0f - noiseFloorAttack) * noiseFloor[i];
-                    else
-                        noiseFloor[i] = noiseFloorRelease * noiseFloor[i] + (1.0f - noiseFloorRelease) * mag;
-
-                    float sub = mag - noiseFloor[i];
-                    if (!std::isfinite(sub) || sub <= 0.0f)
-                        sendBins[i] = 0.0f;
-                    else
-                        sendBins[i] = sub;
-                }
-            }
-            // Debug: log raw values and diagnostics before normalization for first few sends
-            if (sendLogLimit > 0)
-            {
-                juce::String rawS = "raw[0..7]: ";
-                for (int i = 0; i < 8 && i < (int)sendBins.size(); ++i)
-                    rawS += juce::String(sendBins[(size_t)i]) + " ";
-                rawS += " | globalMax=" + juce::String(globalMax) + " idx=" + juce::String(globalMaxIndex) + " nonZero=" + juce::String(nonZeroCount);
-                if (expectedBin >= 0)
-                    rawS += " expectedBin=" + juce::String(expectedBin);
-                if (testToneEnabled.load())
-                {
-                    double logRange10 = std::log10(mapMaxFreq / mapMinFreq);
-                    double tvis = 0.0;
-                    if (testFreqHz > 0.0 && logRange10 > 0.0)
-                        tvis = std::log10((double)testFreqHz / mapMinFreq) / logRange10;
-                    int expectedVis = (int)std::lround(tvis * (double)(outBins - 1));
-                    if (expectedVis < 0) expectedVis = 0;
-                    if (expectedVis > outBins - 1) expectedVis = outBins - 1;
-                    rawS += " expectedVis=" + juce::String(expectedVis);
-                }
-                juce::Logger::writeToLog(rawS);
-            }
-            for (size_t i = 0; i < sendBins.size(); ++i)
-            {
-                float mag = sendBins[i];
-                float db = 20.0f * std::log10f(mag + eps);
-                float norm = (db - minDb) / (maxDb - minDb);
-                if (!std::isfinite(norm)) norm = 0.0f;
-                if (norm < 0.0f) norm = 0.0f;
-                if (norm > 1.0f) norm = 1.0f;
-                sendBins[i] = norm;
-            }
-            if (sendLogLimit > 0)
-            {
-                juce::String normS = "norm[0..7]: ";
-                for (int i = 0; i < 8 && i < (int)sendBins.size(); ++i)
-                    normS += juce::String(sendBins[(size_t)i]) + " ";
-                juce::Logger::writeToLog(normS);
-                --sendLogLimit;
-            }
-
-            // Ensure we always send exactly outBins floats (pad with 0.0 or truncate)
-            if ((int)sendBins.size() < outBins)
-            {
-                sendBins.resize(outBins, 0.0f);
-            }
-            else if ((int)sendBins.size() > outBins)
-            {
-                sendBins.resize(outBins);
-            }
-
-            // send using JUCE OSCMessage (ensures proper OSC formatting)
-            juce::OSCMessage msg("/fft/amplitudes");
-            for (int i = 0; i < outBins; ++i)
-                msg.addFloat32(sendBins[(size_t)i]);
-            bool ok = false;
-            {
-                std::lock_guard<std::mutex> lock(sendMutex);
-                ok = oscSender.send(msg);
-            }
-            if (!ok)
-                juce::Logger::writeToLog("OSC send failed (oscSender)");
-            else if (sendLogLimit > 0)
-            {
-                juce::String s = "Sent /fft/amplitudes count=" + juce::String(outBins) + " first=" + juce::String(sendBins[0]) + " (verbose)";
-                juce::Logger::writeToLog(s);
-                --sendLogLimit;
-            }
-        }
-    });
+    senderThread = std::thread(&FFTOSC::senderLoop, this);
 }
 
 void FFTOSC::stop()
@@ -447,7 +534,7 @@ void FFTOSC::audioDeviceStopped()
     juce::Logger::writeToLog("Audio device stopped");
 }
 
-void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelData, int numInputChannels, float* const* /*outputChannelData*/, int /*numOutputChannels*/, int numSamples, const juce::AudioIODeviceCallbackContext& /*context*/)
+void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelData, int numInputChannels, float* const* outputChannelData, int numOutputChannels, int numSamples, const juce::AudioIODeviceCallbackContext& context)
 {
     // Mix input channels to mono and push into FIFO
     for (int i = 0; i < numSamples; ++i)
@@ -472,6 +559,19 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
             }
             if (numInputChannels > 0)
                 sample /= (float) numInputChannels;
+        }
+
+        // write computed sample to outputs if present (test tone or input-derived)
+        if (outputChannelData != nullptr)
+        {
+            for (int outCh = 0; outCh < numOutputChannels; ++outCh)
+            {
+                float* out = outputChannelData[outCh];
+                if (out != nullptr)
+                {
+                    out[i] = sample;
+                }
+            }
         }
 
         fifo[fifoIndex++] = sample;

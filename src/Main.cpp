@@ -9,7 +9,7 @@ int main (int argc, char* argv[])
     juce::String host = "127.0.0.1";
     int port = 57120;
 
-    // Simple CLI parsing: --host <host> and --port <port>
+    // Simple CLI parsing: only handle --host and --port here (other flags handled later)
     for (int i = 1; i < argc; ++i)
     {
         juce::String arg (argv[i]);
@@ -20,12 +20,6 @@ int main (int argc, char* argv[])
         else if (arg == "--port" && i + 1 < argc)
         {
             port = std::atoi(argv[++i]);
-        }
-        else if (arg == "--test-tone" && i + 1 < argc)
-        {
-            float f = std::atof(argv[++i]);
-            if (f > 0.0f)
-                ; // handled below
         }
         else if (arg == "-h" || arg == "--help")
         {
@@ -47,8 +41,14 @@ int main (int argc, char* argv[])
     bool voiceOnlyEnabled = false;
     double voiceMin = app.getVoiceMinFreq();
     double voiceMax = app.getVoiceMaxFreq();
+    int senderInterval = app.getSenderIntervalMs();
+    bool rmsEnabled = app.getUseRMSAggregation();
     double mapMin = 0.0, mapMax = 0.0;
     bool mapMinSet = false, mapMaxSet = false;
+    bool senderDiag = false;
+    bool noNoiseFloor = false;
+    double noiseFloorInitVal = -1.0; // negative means keep default
+    // bin-range flag removed
 
     for (int i = 1; i < argc; ++i)
     {
@@ -56,6 +56,36 @@ int main (int argc, char* argv[])
         if (arg == "--test-tone" && i + 1 < argc)
         {
             double f = std::atof(argv[++i]);
+            if (f > 1.0)
+            {
+                testToneEnabled = true;
+                testToneFreq = f;
+                app.setTestTone(true, (float)f);
+            }
+            else if (f == 1.0)
+            {
+                testToneEnabled = true;
+                testToneFreq = 440.0;
+                app.setTestTone(true, (float)testToneFreq);
+            }
+        }
+        else if (arg.startsWith("--testTone="))
+        {
+            double f = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
+            if (f <= 1.0 && f > 0.0)
+                f = 440.0;
+            if (f > 0.0)
+            {
+                testToneEnabled = true;
+                testToneFreq = f;
+                app.setTestTone(true, (float)f);
+            }
+        }
+        else if (arg == "--testTone" && i + 1 < argc)
+        {
+            double f = std::atof(argv[++i]);
+            if (f <= 1.0 && f > 0.0)
+                f = 440.0;
             if (f > 0.0)
             {
                 testToneEnabled = true;
@@ -70,15 +100,121 @@ int main (int argc, char* argv[])
             simpleSendBins = b;
             app.setSimpleSend(true, b);
         }
+        else if (arg == "--sender-interval" && i + 1 < argc)
+        {
+            int v = std::atoi(argv[++i]);
+            if (v > 0)
+            {
+                senderInterval = v;
+                app.setSenderIntervalMs(v);
+            }
+        }
+        else if (arg.startsWith("--sender-interval="))
+        {
+            int v = arg.fromFirstOccurrenceOf("=", false, false).getIntValue();
+            if (v > 0)
+            {
+                senderInterval = v;
+                app.setSenderIntervalMs(v);
+            }
+        }
+        else if (arg.startsWith("--senderIntervalMs="))
+        {
+            int v = arg.fromFirstOccurrenceOf("=", false, false).getIntValue();
+            if (v > 0)
+            {
+                senderInterval = v;
+                app.setSenderIntervalMs(v);
+            }
+        }
+        else if (arg == "--senderInterval" && i + 1 < argc)
+        {
+            int v = std::atoi(argv[++i]);
+            if (v > 0)
+            {
+                senderInterval = v;
+                app.setSenderIntervalMs(v);
+            }
+        }
+        else if (arg.startsWith("--senderInterval="))
+        {
+            int v = arg.fromFirstOccurrenceOf("=", false, false).getIntValue();
+            if (v > 0)
+            {
+                senderInterval = v;
+                app.setSenderIntervalMs(v);
+            }
+        }
+        else if (arg == "--diag-sender")
+        {
+            senderDiag = true;
+            app.setSenderDiagnostic(true);
+        }
+        else if (arg.startsWith("--diag-sender="))
+        {
+            int v = arg.fromFirstOccurrenceOf("=", false, false).getIntValue();
+            bool on = (v != 0);
+            senderDiag = on;
+            app.setSenderDiagnostic(on);
+        }
+        else if (arg == "--rms-agg")
+        {
+            rmsEnabled = true;
+            app.setUseRMSAggregation(true);
+        }
+        else if (arg.startsWith("--rms-agg="))
+        {
+            int v = arg.fromFirstOccurrenceOf("=", false, false).getIntValue();
+            bool on = (v != 0);
+            rmsEnabled = on;
+            app.setUseRMSAggregation(on);
+        }
+        else if (arg == "--no-rms")
+        {
+            rmsEnabled = false;
+            app.setUseRMSAggregation(false);
+        }
         else if (arg == "--interp")
         {
             interpEnabled = true;
             app.setInterpMode(true);
         }
+        else if (arg == "--no-noise-floor")
+        {
+            noNoiseFloor = true;
+            app.setUseNoiseFloor(false);
+        }
+        else if (arg.startsWith("--noise-floor-init="))
+        {
+            double v = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
+            noiseFloorInitVal = v;
+            app.setNoiseFloorInit((float)v);
+        }
         else if (arg == "--voice-only")
         {
             voiceOnlyEnabled = true;
             app.setSendVoiceOnly(true);
+        }
+        else if (arg.startsWith("--voice-only="))
+        {
+            juce::String v = arg.fromFirstOccurrenceOf("=", false, false);
+            bool on = (v != "0" && v != "false");
+            voiceOnlyEnabled = on;
+            app.setSendVoiceOnly(on);
+        }
+        else if (arg.startsWith("--voiceOnly="))
+        {
+            juce::String v = arg.fromFirstOccurrenceOf("=", false, false);
+            bool on = (v != "0" && v != "false");
+            voiceOnlyEnabled = on;
+            app.setSendVoiceOnly(on);
+        }
+        else if (arg == "--voiceOnly" && i + 1 < argc)
+        {
+            juce::String v(argv[++i]);
+            bool on = (v != "0" && v.toLowerCase() != "false");
+            voiceOnlyEnabled = on;
+            app.setSendVoiceOnly(on);
         }
         else if (arg == "--voice-min" && i + 1 < argc)
         {
@@ -117,6 +253,7 @@ int main (int argc, char* argv[])
             mapMax = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
             mapMaxSet = true;
         }
+        // --bin-range removed
         else if (arg == "--mapMaxFreq" && i + 1 < argc)
         {
             mapMax = std::atof(argv[++i]);
@@ -139,9 +276,17 @@ int main (int argc, char* argv[])
         + " simpleSend=" + (simpleSendEnabled ? juce::String(simpleSendBins) : "off")
         + " interp=" + (interpEnabled ? "on" : "off")
         + " voiceOnly=" + (voiceOnlyEnabled ? "on" : "off")
+        + " rmsAgg=" + (rmsEnabled ? "on" : "off")
+        + " senderDiag=" + (senderDiag ? "on" : "off")
+        + " senderInterval=" + juce::String(senderInterval)
         + " voiceMin=" + juce::String(voiceMin) + " voiceMax=" + juce::String(voiceMax)
         + " mapMinSet=" + (mapMinSet ? "yes" : "no") + " mapMin=" + juce::String(mapMin)
         + " mapMaxSet=" + (mapMaxSet ? "yes" : "no") + " mapMax=" + juce::String(mapMax);
+    // binRange logging removed
+    if (noNoiseFloor)
+        flagLog += " noNoiseFloor=1";
+    if (noiseFloorInitVal >= 0.0)
+        flagLog += " noiseFloorInit=" + juce::String(noiseFloorInitVal);
     juce::Logger::writeToLog(flagLog);
 
     app.start();

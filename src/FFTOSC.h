@@ -26,6 +26,9 @@ public:
 
     // test tone control (exposed publicly for CLI/main)
     void setTestTone(bool enabled, float freqHz);
+    // sender interval control (ms) for background sender thread
+    void setSenderIntervalMs(int ms);
+    int getSenderIntervalMs() const { return senderIntervalMs; }
     // simple sender mode (bypass audio/FFT and send synthetic bands)
     void setSimpleSend(bool enabled, int bandIndex);
     // enable fractional-bin interpolation mapping (off by default)
@@ -36,9 +39,19 @@ public:
     void setVoiceRange(double minFreq, double maxFreq);
     double getVoiceMinFreq() const { return voiceMinFreq; }
     double getVoiceMaxFreq() const { return voiceMaxFreq; }
+    void setSenderDiagnostic(bool on);
+    // Control whether RMS aggregation is used when downsampling FFT bins to visual bands.
+    void setUseRMSAggregation(bool on);
+    bool getUseRMSAggregation() const;
+    // enable/disable per-band noise-floor subtraction
+    void setUseNoiseFloor(bool on);
+    void setNoiseFloorInit(float initVal);
+    // (bin-range feature removed)
 
 private:
     void timerCallback() override;
+    // background sender loop moved out of start() for clarity
+    void senderLoop();
 
     juce::AudioDeviceManager deviceManager;
     std::unique_ptr<juce::dsp::FFT> fft;
@@ -70,6 +83,9 @@ private:
     std::atomic<bool> senderRunning{false};
     int senderIntervalMs = 33; // ~30 Hz
     int outBins = 64; // number of bins to send over OSC (downsampled)
+    // diagnostic: when enabled, sender will log a timestamp for each OSC packet sent
+    bool senderDiag = false;
+    std::atomic<int> senderDiagCount{0};
 
     // per-band noise floor (to subtract background energy)
     std::vector<float> noiseFloor;
@@ -93,15 +109,25 @@ private:
     float testFreqHz = 440.0f;
     double phase = 0.0;
     double currentSampleRate = 44100.0;
+    // periodic logging for test tone active state
+    int testToneLogCounter = 0; // milliseconds accumulated in sender thread
+    int testToneLogIntervalMs = 3000; // log once every ~3 seconds when enabled
     // interpolation mode (off by default). When enabled, map visual indices
     // to log-frequency targets and sample FFT magnitudes via fractional-bin interpolation.
     bool interpMode = false;
+    // Use RMS (root-mean-square) aggregation when downsampling FFT bins into visual bands.
+    // RMS normalizes for differing numbers of FFT bins per visual band and reflects energy.
+    bool useRMSAggregation = true;
+    // (bin-range feature removed)
     double mapMinFreq = 80.0;
     double mapMaxFreq = 24000.0;
     // voice-range filtering: when true, non-voice bins will be zeroed before sending
     bool sendOnlyVoice = false;
     double voiceMinFreq = 80.0;   // default human voice lower bound (Hz)
     double voiceMaxFreq = 3000.0; // default upper bound for harmonics (Hz)
+
+    // definitions are in the .cpp file
+    
 
     
 
