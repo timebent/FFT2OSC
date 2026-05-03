@@ -1,9 +1,4 @@
 #include "FFTOSC.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <errno.h>
 #include <cstring>
 #include <cmath>
 #include <random>
@@ -22,29 +17,7 @@ FFTOSC::FFTOSC()
     else
         juce::Logger::writeToLog("OSC connect failed to " + oscHost + ":" + juce::String(oscPort));
 
-    // setup raw UDP debug socket
-    debugSock = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (debugSock >= 0)
-    {
-        std::memset(&debugAddr, 0, sizeof(debugAddr));
-        debugAddr.sin_family = AF_INET;
-        debugAddr.sin_port = htons((uint16_t) oscPort);
-        if (inet_pton(AF_INET, oscHost.toRawUTF8(), &debugAddr.sin_addr) == 1)
-        {
-            debugSockValid = true;
-            juce::Logger::writeToLog("Debug UDP socket opened to " + oscHost + ":" + juce::String(oscPort));
-        }
-        else
-        {
-            ::close(debugSock);
-            debugSock = -1;
-            juce::Logger::writeToLog("Debug UDP socket: invalid host");
-        }
-    }
-    else
-    {
-        juce::Logger::writeToLog("Debug UDP socket creation failed: " + juce::String(std::strerror(errno)));
-    }
+    // raw debug UDP socket removed; rely on juce::OSCSender for emission
 
     formatManager.registerBasicFormats();
 }
@@ -67,7 +40,7 @@ void FFTOSC::senderLoop()
 {
     while (senderRunning.load())
     {
-        // copy latest amplitudes or generate synthetic bins when in simple-send mode
+        // copy latest amplitudes
         std::vector<float> sendBins;
         sendBins.reserve(outBins);
         float globalMax = 0.0f;
@@ -75,31 +48,6 @@ void FFTOSC::senderLoop()
         int nonZeroCount = 0;
         int expectedBin = -1;
 
-        if (simpleSendEnabled.load())
-        {
-            // generate synthetic band array: single active band (or sweep if band out of range)
-            sendBins.assign(outBins, 0.0f);
-            int band = simpleSendBand.load();
-            if (band < 0 || band >= outBins)
-            {
-                int b = (int)std::floor(simpleSweepPos) % outBins;
-                sendBins[b] = 1.0f;
-                simpleSweepPos += 1.0;
-                if (simpleSweepPos >= outBins) simpleSweepPos -= outBins;
-                globalMax = 1.0f;
-                globalMaxIndex = b;
-                nonZeroCount = 1;
-            }
-            else
-            {
-                sendBins[band] = 1.0f;
-                globalMax = 1.0f;
-                globalMaxIndex = band;
-                nonZeroCount = 1;
-            }
-            // no FFT inputs, expectedBin is N/A here (we're sending bands directly)
-        }
-        else
         {
             // copy latest amplitudes
             std::vector<float> ampsCopy;
@@ -140,19 +88,8 @@ void FFTOSC::senderLoop()
                 edges.reserve(outBins + 1);
                 double logMin = std::log(1.0);
                 double logMax = std::log((double)total);
-                if (!interpMode)
-                {
-                    edges.push_back(0);
-                    for (int k = 1; k < outBins; ++k)
-                    {
-                        double t = (double)k / (double)outBins;
-                        int idx = (int)std::floor(std::exp(logMin + (logMax - logMin) * t));
-                        if (idx < 1) idx = 1;
-                        if (idx > (int)total - 1) idx = (int)total - 1;
-                        edges.push_back(idx);
-                    }
-                    edges.push_back((int)total);
-                }
+                // Use fractional-bin interpolation to sample amplitudes at
+                // log-spaced target frequencies (always enabled).
 
                 // compute global peak and count of non-zero bins (before downsampling)
                 const float zeroEps = 1e-9f;
@@ -168,35 +105,8 @@ void FFTOSC::senderLoop()
                         ++nonZeroCount;
                 }
 
-                if (!interpMode)
-                {
-                    // Aggregate FFT bins into output visual bands.
-                    for (int b = 0; b < outBins; ++b)
-                    {
-                        int start = edges[b];
-                        int end = edges[b+1];
-                        if (start >= (int)total) { sendBins.push_back(0.0f); continue; }
-                        end = std::min(end, (int)total);
-                        int count = end - start;
-                        if (count <= 0)
-                        {
-                            sendBins.push_back(0.0f);
-                            continue;
-                        }
-                        double sumSq = 0.0;
-                        for (int i = start; i < end; ++i)
-                        {
-                            float v = ampsCopy[(size_t)i];
-                            if (!std::isfinite(v) || v <= 0.0f)
-                                v = 0.0f;
-                            sumSq += (double)v * (double)v;
-                        }
-                        double meanSq = sumSq / (double)count;
-                        float rms = (float)std::sqrt(meanSq);
-                        sendBins.push_back(rms);
-                    }
-                }
-                else
+                // Always use interpolation: sample fractional FFT bins at
+                // log-spaced target frequencies and push interpolated values.
                 {
                     double logRange = std::log10(mapMaxFreq / mapMinFreq);
                     for (int b = 0; b < outBins; ++b)
@@ -233,12 +143,6 @@ void FFTOSC::senderLoop()
         const float maxReasonable = 1e12f; // clamp extreme values
         const float scale = (fftSize > 0) ? (1.0f / (float) fftSize) : 1.0f;
 
-        // If forceSilence is enabled, override all bins to zero immediately
-        if (forceSilence)
-        {
-            sendBins.assign(outBins, 0.0f);
-        }
-
         for (size_t i = 0; i < sendBins.size(); ++i)
         {
             float v = sendBins[i];
@@ -256,45 +160,7 @@ void FFTOSC::senderLoop()
         // noise-floor subtraction and dB normalization cannot re-introduce
         // energy into bands outside the requested voice range.)
 
-        // initialize noise floor vector to match sendBins size; allow fixed-or-adaptive modes
-        if (useNoiseFloor)
-        {
-            if (noiseFloorFixed)
-            {
-                // Fixed floor: subtract the configured init value from every band
-                for (size_t i = 0; i < sendBins.size(); ++i)
-                {
-                    float mag = sendBins[i];
-                    if (!std::isfinite(mag)) mag = 0.0f;
-                    float sub = mag - noiseFloorInit;
-                    if (!std::isfinite(sub) || sub <= 0.0f)
-                        sendBins[i] = 0.0f;
-                    else
-                        sendBins[i] = sub;
-                }
-            }
-            else
-            {
-                if (noiseFloor.size() != sendBins.size())
-                    noiseFloor.assign(sendBins.size(), noiseFloorInit);
-
-                for (size_t i = 0; i < sendBins.size(); ++i)
-                {
-                    float mag = sendBins[i];
-                    if (!std::isfinite(mag)) mag = 0.0f;
-                    if (mag < noiseFloor[i])
-                        noiseFloor[i] = noiseFloorAttack * mag + (1.0f - noiseFloorAttack) * noiseFloor[i];
-                    else
-                        noiseFloor[i] = noiseFloorRelease * noiseFloor[i] + (1.0f - noiseFloorRelease) * mag;
-
-                    float sub = mag - noiseFloor[i];
-                    if (!std::isfinite(sub) || sub <= 0.0f)
-                        sendBins[i] = 0.0f;
-                    else
-                        sendBins[i] = sub;
-                }
-            }
-        }
+        // (noise-floor subtraction removed)
 
         if (sendLogLimit > 0)
         {
@@ -434,29 +300,7 @@ FFTOSC::FFTOSC(const juce::String& host, int port)
     else
         juce::Logger::writeToLog("OSC connect failed to " + oscHost + ":" + juce::String(oscPort));
 
-    // setup raw UDP debug socket
-    debugSock = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (debugSock >= 0)
-    {
-        std::memset(&debugAddr, 0, sizeof(debugAddr));
-        debugAddr.sin_family = AF_INET;
-        debugAddr.sin_port = htons((uint16_t) oscPort);
-        if (inet_pton(AF_INET, oscHost.toRawUTF8(), &debugAddr.sin_addr) == 1)
-        {
-            debugSockValid = true;
-            juce::Logger::writeToLog("Debug UDP socket opened to " + oscHost + ":" + juce::String(oscPort));
-        }
-        else
-        {
-            ::close(debugSock);
-            debugSock = -1;
-            juce::Logger::writeToLog("Debug UDP socket: invalid host");
-        }
-    }
-    else
-    {
-        juce::Logger::writeToLog("Debug UDP socket creation failed: " + juce::String(std::strerror(errno)));
-    }
+    // raw debug UDP socket removed; rely on juce::OSCSender for emission
     formatManager.registerBasicFormats();
 }
 
@@ -615,18 +459,7 @@ void FFTOSC::setFilePlaybackEnabled(bool on)
     }
 }
 
-void FFTOSC::setSimpleSend(bool enabled, int bandIndex)
-{
-    simpleSendEnabled.store(enabled);
-    simpleSendBand.store(bandIndex);
-    juce::Logger::writeToLog("Simple send " + juce::String(enabled ? "enabled" : "disabled") + " band=" + juce::String(bandIndex));
-}
-
-void FFTOSC::setInterpMode(bool enabled)
-{
-    interpMode = enabled;
-    juce::Logger::writeToLog("Interpolation mode " + juce::String(enabled ? "enabled" : "disabled"));
-}
+// fractional-bin interpolation is always enabled; setInterpMode removed
 
 void FFTOSC::setSenderIntervalMs(int ms)
 {
@@ -649,37 +482,9 @@ void FFTOSC::setUseRMSAggregation(bool on)
     useRMSAggregation = on;
     juce::Logger::writeToLog(juce::String("RMS aggregation ") + (on ? "enabled" : "disabled"));
 }
+// noise-floor API removed
 
-void FFTOSC::setUseNoiseFloor(bool on)
-{
-    useNoiseFloor = on;
-    juce::Logger::writeToLog(juce::String("Noise floor ") + (on ? "enabled" : "disabled"));
-    if (!useNoiseFloor)
-        noiseFloor.clear();
-}
-
-void FFTOSC::setNoiseFloorInit(float initVal)
-{
-    noiseFloorInit = initVal;
-    juce::Logger::writeToLog("Noise floor init set to " + juce::String(noiseFloorInit));
-    // if floor vector exists, reinit
-    if (!noiseFloor.empty())
-        std::fill(noiseFloor.begin(), noiseFloor.end(), noiseFloorInit);
-}
-
-void FFTOSC::setNoiseFloorFixed(bool on)
-{
-    noiseFloorFixed = on;
-    juce::Logger::writeToLog(juce::String("Noise floor fixed mode ") + (on ? "enabled" : "disabled"));
-    if (on)
-        noiseFloor.clear();
-}
-
-void FFTOSC::setForceSilence(bool on)
-{
-    forceSilence = on;
-    juce::Logger::writeToLog(juce::String("Force silence ") + (on ? "enabled" : "disabled"));
-}
+// setForceSilence removed
 
 // bin-range feature removed
 
@@ -717,45 +522,37 @@ void FFTOSC::setVoiceRange(double minFreq, double maxFreq)
 FFTOSC::~FFTOSC()
 {
     stop();
-    if (debugSockValid && debugSock >= 0)
-        ::close(debugSock);
 }
 
 void FFTOSC::start()
 {
-    if (!simpleSendEnabled.load())
+    // Initialize audio device
+    // If a test tone is enabled, request both input and outputs so mic+tone work together
+    int numInputs = 1;
+    // Request stereo outputs by default so microphone passthrough is audible
+    int numOutputs = 2;
+    if (testToneEnabled.load())
+        numOutputs = 2;
+    // If file playback is enabled we need output channels so the audio callback
+    // runs and `transportSource.getNextAudioBlock()` is called to advance files.
+    if (filePlaybackEnabled)
+        numOutputs = std::max(numOutputs, 2);
+    deviceManager.initialiseWithDefaultDevices(numInputs, numOutputs);
+    deviceManager.addAudioCallback(this);
     {
-        // If a test tone is enabled, request both input and outputs so mic+tone work together
-        int numInputs = 1;
-        // Request stereo outputs by default so microphone passthrough is audible
-        int numOutputs = 2;
-        if (testToneEnabled.load())
-            numOutputs = 2;
-        // If file playback is enabled we need output channels so the audio callback
-        // runs and `transportSource.getNextAudioBlock()` is called to advance files.
-        if (filePlaybackEnabled)
-            numOutputs = std::max(numOutputs, 2);
-        deviceManager.initialiseWithDefaultDevices(numInputs, numOutputs);
-        deviceManager.addAudioCallback(this);
+        auto* dev = deviceManager.getCurrentAudioDevice();
+        if (dev != nullptr)
         {
-            auto* dev = deviceManager.getCurrentAudioDevice();
-            if (dev != nullptr)
-            {
-                juce::Logger::writeToLog("Audio device init: " + dev->getName()
-                                         + " rate=" + juce::String(dev->getCurrentSampleRate())
-                                         + " inputs=" + juce::String(dev->getActiveInputChannels().countNumberOfSetBits())
-                                         + " outputs=" + juce::String(dev->getActiveOutputChannels().countNumberOfSetBits()));
-            }
-            else
-            {
-                juce::Logger::writeToLog("Audio device init: no device returned by deviceManager");
-            }
+            juce::Logger::writeToLog("Audio device init: " + dev->getName()
+                                     + " rate=" + juce::String(dev->getCurrentSampleRate())
+                                     + " inputs=" + juce::String(dev->getActiveInputChannels().countNumberOfSetBits())
+                                     + " outputs=" + juce::String(dev->getActiveOutputChannels().countNumberOfSetBits()));
         }
-    }
         else
         {
-            juce::Logger::writeToLog("Simple sender enabled: skipping audio device init");
+            juce::Logger::writeToLog("Audio device init: no device returned by deviceManager");
         }
+    }
 
     // start background sender thread
     senderRunning.store(true);
@@ -924,18 +721,7 @@ void FFTOSC::setAutoPlayThresholdDb(double db)
     juce::Logger::writeToLog("Ignored setAutoPlayThresholdDb(" + juce::String(db) + "): auto-playback removed");
 }
 
-void FFTOSC::setMicFadeOnInput(bool on)
-{
-    micFadeOnInput = on;
-    juce::Logger::writeToLog(juce::String("Mic-fade-on-input ") + (on ? "enabled" : "disabled"));
-}
-
-void FFTOSC::setMicFadeThresholdDb(double db)
-{
-    micFadeThresholdDb = db;
-    micFadeThresholdLinear = std::pow(10.0, db / 20.0);
-    juce::Logger::writeToLog("Mic-fade threshold set: " + juce::String(db) + " dB => " + juce::String(micFadeThresholdLinear));
-}
+// mic-fade setters removed
 
 void FFTOSC::setAutoPlayHoldMs(int ms)
 {
@@ -963,8 +749,6 @@ void FFTOSC::startAutoplayToggleTest(int playMs, int cycles)
         {
             // enable playback
             setFilePlaybackEnabled(true);
-            // ensure we aren't immediately affected by mic-driven fades
-            setMicFadeOnInput(false);
             int slept = 0;
             while (autoplayTestRunning.load() && slept < playMs)
             {
@@ -1011,69 +795,9 @@ void FFTOSC::setDisplayNoiseFloorDb(double db)
     juce::Logger::writeToLog("Display noise-floor (min dB) set to " + juce::String(displayMinDb));
 }
 
-void FFTOSC::runForcedFadeTest(int durationMs, float micLevel)
-{
-    if (durationMs <= 0) durationMs = 1000;
-    juce::Logger::writeToLog("runForcedFadeTest: duration=" + juce::String(durationMs) + "ms level=" + juce::String(micLevel));
+// runForcedFadeTest removed
 
-    // Ensure mic-fade logic is active for the test
-    bool prevMicFade = micFadeOnInput;
-    micFadeOnInput = true;
-
-    // Seed input level atoms so timer() observes a high mic level
-    lastInputLevel.store(micLevel);
-    lastInputRms.store(micLevel);
-
-    int iterations = std::max(1, durationMs / 50);
-    for (int i = 0; i < iterations; ++i)
-    {
-        // Manually invoke timer logic to exercise fading without real audio callbacks
-        // ensure the timer sees sustained high mic level for the duration
-        lastInputLevel.store(micLevel);
-        lastInputRms.store(micLevel);
-        timerCallback();
-        juce::Logger::writeToLog("runForcedFadeTest: playbackGain=" + juce::String(playbackGain.load()));
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-
-    micFadeOnInput = prevMicFade;
-    juce::Logger::writeToLog("runForcedFadeTest: done, playbackGain=" + juce::String(playbackGain.load()));
-}
-
-void FFTOSC::runForcedFadeResumeTest(int highMs, int lowMs, float lowLevel)
-{
-    if (highMs <= 0) highMs = 1000;
-    if (lowMs <= 0) lowMs = 10000;
-    juce::Logger::writeToLog("runForcedFadeResumeTest: high=" + juce::String(highMs) + "ms low=" + juce::String(lowMs) + "ms lowLevel=" + juce::String(lowLevel));
-
-    bool prevMicFade = micFadeOnInput;
-    micFadeOnInput = true;
-
-    // Phase 1: sustained high to force fade-down
-    int iterationsHigh = std::max(1, highMs / 50);
-    for (int i = 0; i < iterationsHigh; ++i)
-    {
-        lastInputLevel.store(1.0f);
-        lastInputRms.store(1.0f);
-        timerCallback();
-        juce::Logger::writeToLog("runForcedFadeResumeTest[high]: playbackGain=" + juce::String(playbackGain.load()));
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-
-    // Phase 2: sustained low for resume window
-    int iterationsLow = std::max(1, lowMs / 50);
-    for (int i = 0; i < iterationsLow; ++i)
-    {
-        lastInputLevel.store(lowLevel);
-        lastInputRms.store(lowLevel);
-        timerCallback();
-        juce::Logger::writeToLog("runForcedFadeResumeTest[low]: playbackGain=" + juce::String(playbackGain.load()));
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-
-    micFadeOnInput = prevMicFade;
-    juce::Logger::writeToLog("runForcedFadeResumeTest: done, playbackGain=" + juce::String(playbackGain.load()));
-}
+// runForcedFadeResumeTest removed
 
 void FFTOSC::stop()
 {
@@ -1193,36 +917,11 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
 
         float sample = 0.0f;
 
-        // If microphone input exceeds mic-fade threshold, prefer mic input
-        bool micActive = false;
-        if (numInputChannels > 0)
-        {
-            float absMic = std::abs(micSample);
-            if (absMic > maxAbsMic) maxAbsMic = absMic;
-            // determine effective threshold: use mic-fade threshold if configured,
-            // otherwise use a very small default to avoid spurious triggers.
-            double thr = 1e-6;
-            if (micFadeOnInput && std::isfinite(micFadeThresholdLinear))
-                thr = micFadeThresholdLinear;
-            if (!std::isfinite(thr) || thr <= 0.0)
-                thr = 1e-6;
-            micActive = (absMic > (float)thr);
-            // (playback-startup grace suppression removed — not needed for OSC-only use)
-        }
-
+        // Select sample source. Mic-driven fade logic removed; prefer playback
+        // when transport and playback buffer are available, otherwise use
+        // test tone if enabled, else fall back to mic input.
         bool sampleFromPlaybackFlag = false;
-        if (micActive)
-        {
-            // prefer mic; do not stop transport from the audio thread. The timer
-            // will handle fading playback down when sustained mic activity is observed.
-            if (transportPlaying)
-            {
-                transportPlaying = true; // keep transport running so it continues to advance
-                juce::Logger::writeToLog("audio callback: mic activity detected (playback fade-down will be applied)");
-            }
-            sample = micSample;
-        }
-        else if (transportPlaying && filePlaybackEnabled && havePlaybackBuf)
+        if (transportPlaying && filePlaybackEnabled && havePlaybackBuf)
         {
             sample = playbackSample;
             sampleFromPlaybackFlag = true;
@@ -1375,7 +1074,6 @@ void FFTOSC::timerCallback()
             juce::Logger::writeToLog("DEBUG_TIMER: micLevel=" + juce::String(micLevel)
                                      + " rms=" + juce::String(micRms)
                                      + " peak=" + juce::String(micPeak)
-                                     + " micAboveMs=" + juce::String(micAboveMs.load())
                                      + " playbackGain=" + juce::String(playbackGain.load()));
         }
 

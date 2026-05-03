@@ -1,7 +1,6 @@
 #pragma once
 
 #include <JuceHeader.h>
-#include <netinet/in.h>
 #include <mutex>
 #include <atomic>
 
@@ -30,10 +29,8 @@ public:
     // sender interval control (ms) for background sender thread
     void setSenderIntervalMs(int ms);
     int getSenderIntervalMs() const { return senderIntervalMs; }
-    // simple sender mode (bypass audio/FFT and send synthetic bands)
-    void setSimpleSend(bool enabled, int bandIndex);
-    // enable fractional-bin interpolation mapping (off by default)
-    void setInterpMode(bool enabled);
+    // simple sender mode (bypass audio/FFT and send synthetic bands) - removed
+    // fractional-bin interpolation mapping is always enabled
     // mapping and voice-range control (public)
     void setMapFreqRange(double minFreq, double maxFreq);
     void setSendVoiceOnly(bool enabled);
@@ -44,20 +41,12 @@ public:
     // Control whether RMS aggregation is used when downsampling FFT bins to visual bands.
     void setUseRMSAggregation(bool on);
     bool getUseRMSAggregation() const;
-    // enable/disable per-band noise-floor subtraction
-    void setUseNoiseFloor(bool on);
-    void setNoiseFloorInit(float initVal);
-    void setNoiseFloorFixed(bool on);
-    // Force sender to emit all-zero payloads (testing/debug)
-    void setForceSilence(bool on);
+    // (per-band noise-floor processing removed)
     // Auto-playback controls
     void setAutoPlayback(bool on);
     void setAutoPlayThresholdDb(double db);
     void setAutoPlayHoldMs(int ms);
-    // Mic-driven fade controls: when enabled, playback gain will be reduced
-    // if the input peak exceeds the configured threshold (linear dB scale).
-    void setMicFadeOnInput(bool on);
-    void setMicFadeThresholdDb(double db);
+    // (mic-fade and force-silence features removed)
     // (bin-range feature removed)
 
     // File playback (urn) support: play files one-at-a-time into the FFT input
@@ -77,13 +66,7 @@ public:
     // control verbose logging (disable to suppress noisy diagnostics)
     void setVerboseLogging(bool on);
 
-    // Test helper: simulate sustained mic input for `durationMs` milliseconds
-    // at `micLevel` (linear 0..1). This will repeatedly invoke the timer
-    // logic so fades are exercised without real microphone input.
-    void runForcedFadeTest(int durationMs, float micLevel);
-    // Run a two-phase forced fade test: sustained high mic for `highMs`,
-    // then sustained low mic at `lowLevel` for `lowMs` to exercise resume.
-    void runForcedFadeResumeTest(int highMs, int lowMs, float lowLevel);
+    // (mic-fade test helpers removed)
 
 private:
     void timerCallback() override;
@@ -111,10 +94,7 @@ private:
     int fftProducedCounter = 0;
     int timerCallCounter = 0;
 
-    // debug raw UDP socket to verify OS-level emission
-    int debugSock = -1;
-    bool debugSockValid = false;
-    struct sockaddr_in debugAddr;
+    // (raw debug UDP socket removed; use juce::OSCSender)
 
     // sender thread (avoids relying on JUCE Timer / MessageThread)
     std::thread senderThread;
@@ -125,26 +105,11 @@ private:
     bool senderDiag = false;
     std::atomic<int> senderDiagCount{0};
 
-    // per-band noise floor (to subtract background energy)
-    std::vector<float> noiseFloor;
-    float noiseFloorAttack = 0.5f;   // how quickly floor drops when quieter (0..1). Larger -> faster
-    float noiseFloorRelease = 0.9f; // how quickly floor rises when louder (smaller -> faster)
-    float noiseFloorInit = 1e6f;     // initial large floor value
-    bool useNoiseFloor = true;
-    // when true, the configured `noiseFloorInit` is used as a fixed floor
-    // and the adaptive attack/release updates are disabled
-    bool noiseFloorFixed = false;
+    // (noise-floor members removed)
 
-    // Mic-driven fade: when enabled, playback gain is reduced
-    // if the input peak exceeds the configured threshold (linear dB scale).
-    bool micFadeOnInput = false;
-    double micFadeThresholdDb = std::numeric_limits<double>::quiet_NaN();
-    double micFadeThresholdLinear = 0.0;
+    // (mic-fade members removed)
 
-    // simple synthetic sender (bypass audio/FFT)
-    std::atomic<bool> simpleSendEnabled{false};
-    std::atomic<int> simpleSendBand{0};
-    double simpleSweepPos = 0.0;
+    // simple synthetic sender (bypass audio/FFT) - removed
 
     juce::OSCSender oscSender;
     juce::String oscHost = "127.0.0.1";
@@ -159,9 +124,7 @@ private:
     // periodic logging for test tone active state
     int testToneLogCounter = 0; // milliseconds accumulated in sender thread
     int testToneLogIntervalMs = 3000; // log once every ~3 seconds when enabled
-    // interpolation mode (enabled by default). When enabled, map visual indices
-    // to log-frequency targets and sample FFT magnitudes via fractional-bin interpolation.
-    bool interpMode = true;
+    // fractional-bin interpolation is always used to sample magnitudes.
     // Use RMS (root-mean-square) aggregation when downsampling FFT bins into visual bands.
     // RMS normalizes for differing numbers of FFT bins per visual band and reflects energy.
     bool useRMSAggregation = true;
@@ -207,9 +170,6 @@ private:
     // When true, force the fileFeeder path even if OS outputs are available
     bool forceFileFeeder = false;
 
-    // When true, the sender will send all-zero payloads regardless of FFT
-    bool forceSilence = false;
-
     // Minimum dB used when converting magnitudes to normalized 0..1 for display
     float displayMinDb = -80.0f;
 
@@ -224,23 +184,10 @@ private:
     // safe real-time thread reads without locking.
     std::atomic<long long> lastPlaybackStartMs{0};
     // last observed input absolute level (max per audio callback). Updated
-    // from the audio thread and sampled by timerCallback for consistent
-    // mic-fade decisions.
+    // from the audio thread and sampled by timerCallback for diagnostics.
     std::atomic<float> lastInputLevel{0.0f};
     // last observed input RMS level (per-audio-callback RMS of mic samples)
     std::atomic<float> lastInputRms{0.0f};
-    // Counters used by the RMS-triggered fade state machine (ms)
-    std::atomic<int> micAboveMs{0};
-    // Counter for how long mic has been below threshold (ms)
-    std::atomic<int> micBelowMs{0};
-    // Whether the mic was previously above the detection threshold long enough
-    // to trigger a fade-down. Used to detect the "cross from above to below"
-    // transition so resume timing only begins after that event.
-    std::atomic<bool> micWasAbove{false};
-    // Fade configuration: ms above threshold to fade down (automatic fade-up removed)
-    int micFadeThresholdMsHigh = 500;
-    // ms below threshold to resume playback (auto-fade-up). Default 10s.
-    int micFadeResumeMs = 10000;
     // Playback gain state (0.0..1.0) and fade params
     std::atomic<float> playbackGain{1.0f};
     float playbackFadeDownGain = 0.0f; // target gain when mic active (fade to silence)
@@ -252,8 +199,7 @@ private:
     int playbackStartupGraceMs = 0;
     void setPlaybackStartupGraceMs(int ms) { if (ms >= 0) playbackStartupGraceMs = ms; }
 
-    // Audio gate: delegates mic-driven fade/resume logic
-    // AudioGate removed: mic-driven fade logic simplified/disabled
+    // Audio gate and mic-fade logic removed.
 
 public:
     void setShufflePlayback(bool on) { shufflePlayback = on; juce::Logger::writeToLog(juce::String("Shuffle playback ") + (on ? "enabled" : "disabled")); }
