@@ -504,8 +504,8 @@ int main (int argc, char* argv[])
         flagLog += " autoPlayHoldMs=" + juce::String(autoPlayHoldMs);
     if (shufflePlay)
         flagLog += " shufflePlay=1";
-    if (std::isfinite(displayNoiseFloorDb))
-        flagLog += " displayNoiseFloorDb=" + juce::String(displayNoiseFloorDb);
+    // Always log the effective display noise-floor (defaults to FFTOSC's default)
+    flagLog += " displayNoiseFloorDb=" + juce::String(app.getDisplayNoiseFloorDb());
     if (hpCutoffSet)
         flagLog += " hpCutoff=" + juce::String(hpCutoff);
     juce::Logger::writeToLog(flagLog);

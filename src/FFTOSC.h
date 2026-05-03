@@ -63,6 +63,7 @@ public:
 
     // Adjust display noise-floor (minimum dB used when mapping magnitudes to 0..1)
     void setDisplayNoiseFloorDb(double db);
+    double getDisplayNoiseFloorDb() const;
     // High-pass filter control
     void setHighPassCutoffHz(double hz);
     double getHighPassCutoffHz() const { return hpCutoffHz; }
@@ -173,7 +174,8 @@ private:
     bool forceFileFeeder = false;
 
     // Minimum dB used when converting magnitudes to normalized 0..1 for display
-    float displayMinDb = -80.0f;
+    // Default to -60 dB (display noise-floor enabled by default)
+    float displayMinDb = -60.0f;
 
     // runtime verbosity: when false, suppress non-essential diagnostic logs
     bool verboseLogging = true;

@@ -795,6 +795,11 @@ void FFTOSC::setDisplayNoiseFloorDb(double db)
     juce::Logger::writeToLog("Display noise-floor (min dB) set to " + juce::String(displayMinDb));
 }
 
+double FFTOSC::getDisplayNoiseFloorDb() const
+{
+    return (double)displayMinDb;
+}
+
 void FFTOSC::setHighPassCutoffHz(double hz)
 {
     if (hz <= 0.0)
