@@ -126,6 +126,8 @@ void FFTOSC::senderLoop()
                         float interp = (float)(v0 + frac * (v1 - v0));
                         sendBins.push_back(interp);
                     }
+    // File-feeder feature removed: if no outputs are available, playback
+    // will be silent. Users may enable file playback only when outputs exist.
                 }
 
                 if (testToneEnabled.load() && currentSampleRate > 0.0)
@@ -370,82 +372,8 @@ void FFTOSC::setFilePlaybackEnabled(bool on)
     }
     juce::Logger::writeToLog(juce::String("File playback ") + (on ? "enabled" : "disabled"));
 
-    // If there are no OS outputs available (e.g. inputs-only device), start
-    // a feeder thread that reads file samples directly and feeds them into
-    // the FFT path for analysis. This allows testing without an active
-    // audio output device.
-    auto* dev = deviceManager.getCurrentAudioDevice();
-    bool outputsAvailable = (dev != nullptr) && (dev->getActiveOutputChannels().countNumberOfSetBits() > 0);
-    if (forceFileFeeder)
-    {
-        outputsAvailable = false;
-        juce::Logger::writeToLog("Force file feeder requested: treating outputs as unavailable");
-    }
-
-    if (on && !outputsAvailable)
-    {
-        // start feeder
-        if (!fileFeederRunning.load())
-        {
-            fileFeederRunning.store(true);
-            fileFeederThread = std::thread([this]() {
-                // simple sequential feeder: loop through playbackFiles and read samples
-                while (fileFeederRunning.load())
-                {
-                    if (playbackFiles.empty())
-                    {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        continue;
-                    }
-                    for (size_t fi = 0; fi < playbackFiles.size() && fileFeederRunning.load(); ++fi)
-                    {
-                        juce::File f = playbackFiles[fi];
-                        std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(f));
-                        if (!reader) { juce::Logger::writeToLog("fileFeeder: failed to open " + f.getFullPathName()); continue; }
-                        const int block = 512;
-                        juce::AudioBuffer<float> buf((int)reader->numChannels, block);
-                        juce::int64 pos = 0;
-                        juce::int64 total = reader->lengthInSamples;
-                        double sr = reader->sampleRate;
-                        while (pos < total && fileFeederRunning.load())
-                        {
-                            int toRead = (int)std::min<int64_t>(block, total - pos);
-                            buf.clear();
-                            reader->read(&buf, 0, toRead, pos, true, true);
-                            pos += toRead;
-                            // mix channels to mono and push to FFT
-                            std::vector<float> mono((size_t)toRead);
-                            for (int i = 0; i < toRead; ++i)
-                            {
-                                float s = 0.0f;
-                                for (int ch = 0; ch < buf.getNumChannels(); ++ch)
-                                    s += buf.getSample(ch, i);
-                                mono[i] = s / (float)buf.getNumChannels();
-                            }
-                            pushSamplesToFFT(mono.data(), toRead);
-                            // pace reads roughly according to sample rate
-                            int ms = (int)std::round((double)toRead / sr * 1000.0);
-                            if (ms > 0)
-                                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-                        }
-                        juce::Logger::writeToLog("fileFeeder: finished " + f.getFileName());
-                    }
-                }
-                juce::Logger::writeToLog("fileFeeder: stopped");
-            });
-            juce::Logger::writeToLog("fileFeeder: started (no OS outputs available)");
-        }
-    }
-    else
-    {
-        // stop feeder if running
-        if (fileFeederRunning.load())
-        {
-            fileFeederRunning.store(false);
-            if (fileFeederThread.joinable()) fileFeederThread.join();
-            juce::Logger::writeToLog("fileFeeder: stopped by setFilePlaybackEnabled");
-        }
-    }
+    // File-feeder feature removed: when no OS outputs are available,
+    // file playback will be silent. No background feeder thread is spawned.
 
     // If we've just enabled file playback and we have files available but
     // no reader is currently set, request the playback thread to start the
@@ -728,13 +656,10 @@ void FFTOSC::setAutoPlayHoldMs(int ms)
     juce::Logger::writeToLog("Ignored setAutoPlayHoldMs(" + juce::String(ms) + "): auto-playback removed");
 }
 
+// Force-file-feeder API removed: keep a no-op stub for compatibility
 void FFTOSC::setForceFileFeeder(bool on)
 {
-    forceFileFeeder = on;
-    juce::Logger::writeToLog(juce::String("Force file feeder ") + (on ? "enabled" : "disabled"));
-    // re-evaluate playback enabling to start/stop feeder if files are enabled
-    if (filePlaybackEnabled)
-        setFilePlaybackEnabled(true);
+    juce::Logger::writeToLog("Ignored setForceFileFeeder(" + juce::String(on ? "true" : "false") + "): feature removed");
 }
 
 void FFTOSC::startAutoplayToggleTest(int playMs, int cycles)
@@ -838,10 +763,7 @@ void FFTOSC::stop()
     if (playbackThread.joinable())
         playbackThread.join();
 
-    // stop feeder thread if running
-    fileFeederRunning.store(false);
-    if (fileFeederThread.joinable())
-        fileFeederThread.join();
+    // file-feeder removed; nothing to stop here
 
     deviceManager.removeAudioCallback(this);
     deviceManager.closeAudioDevice();
@@ -886,6 +808,32 @@ void FFTOSC::audioDeviceStopped()
 
 void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelData, int numInputChannels, float* const* outputChannelData, int numOutputChannels, int numSamples, const juce::AudioIODeviceCallbackContext& context)
 {
+    // Periodic, low-rate diagnostics to verify microphone input is arriving.
+    static int inputDiagCallbackCounter = 0;
+    if ((++inputDiagCallbackCounter % 500) == 0)
+    {
+        juce::String s = "audio callback diag: numInputChannels=" + juce::String(numInputChannels)
+            + " numSamples=" + juce::String(numSamples)
+            + " numOutputChannels=" + juce::String(numOutputChannels);
+        juce::Logger::writeToLog(s);
+        for (int ch = 0; ch < numInputChannels; ++ch)
+        {
+            if (inputChannelData == nullptr || inputChannelData[ch] == nullptr)
+                juce::Logger::writeToLog("audio callback: inputChannelData[" + juce::String(ch) + "] is null");
+            else
+            {
+                // compute RMS of first channel sample block for diagnostics
+                double sum = 0.0;
+                const float* in = inputChannelData[ch];
+                for (int i = 0; i < numSamples; ++i) sum += (double)in[i] * (double)in[i];
+                double rms = (numSamples > 0) ? std::sqrt(sum / (double)numSamples) : 0.0;
+                juce::Logger::writeToLog("audio callback: ch=" + juce::String(ch) + " rms=" + juce::String(rms));
+            }
+        }
+    }
+
+    // (debug passthrough removed)
+
     // Mix input channels to mono and push into FIFO
     juce::AudioBuffer<float> tmpBuf;
     juce::AudioSourceChannelInfo tmpInfo;
@@ -925,24 +873,7 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
             micSample = y;
         }
 
-        // DEBUG: force direct microphone passthrough to outputs for testing
-        // This writes the mixed mic sample immediately to all output channels
-        // and sets a flag so the normal output-writing path is skipped.
-        bool debugForcePassthrough = true;
-        bool debugPassthroughDone = false;
-        if (debugForcePassthrough && outputChannelData != nullptr)
-        {
-            float dbgOut = micSample;
-            for (int outCh = 0; outCh < numOutputChannels; ++outCh)
-            {
-                float* out = outputChannelData[outCh];
-                if (out != nullptr)
-                    out[i] = dbgOut;
-            }
-            outSumSquares += (double)dbgOut * (double)dbgOut;
-            ++outSamplesCount;
-            debugPassthroughDone = true;
-        }
+        // debug passthrough removed
 
         // accumulate for RMS computation (mic only)
         if (numInputChannels > 0)
@@ -983,8 +914,8 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
             sample = micSample;
         }
 
-        // write computed sample to outputs if present (skip if debug passthrough already wrote)
-        if (outputChannelData != nullptr && !debugPassthroughDone)
+        // write computed sample to outputs if present
+        if (outputChannelData != nullptr)
         {
             // apply playback gain to playback-derived samples so fades are
             // audible even if transportSource gain isn't taking effect.

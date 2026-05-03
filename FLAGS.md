@@ -14,13 +14,12 @@ Flags (short):
 - --play-dir <path>     — play all supported files in directory
 - --rms-agg             — use RMS aggregation when not using interpolation
 - --no-rms              — disable RMS aggregation
-- --auto-playback       — enable auto file playback on silence
-- --auto-play-threshold-db=X
-- --mic-fade-threshold-db=X (alias: --suspend-threshold-db=X)
-- --auto-play-hold-ms=X
- - (fractional-bin interpolation is always enabled)
-- --force-feeder        — force file-feeder when outputs unavailable
-- --display-noise-floor-db=X
+ --auto-playback       — enable auto file playback on silence
+ --auto-play-threshold-db=X
+ --mic-fade-threshold-db=X (alias: --suspend-threshold-db=X)
+ --auto-play-hold-ms=X
+ (fractional-bin interpolation is always enabled)
+ --display-noise-floor-db=X
 - --voice-only[=0|1]    — enable/disable voice-only masking
 - --voice-min <Hz>
 - --voice-max <Hz>
