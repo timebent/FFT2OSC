@@ -224,7 +224,7 @@ int main (int argc, char* argv[])
         {
             double v = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
             suspendThresholdDb = v;
-            app.setMicFadeThresholdDb(v);
+            juce::Logger::writeToLog("--suspend-threshold-db ignored: mic-fade disabled in this build");
         }
         else if (arg.startsWith("--auto-play-hold-ms="))
         {
@@ -545,13 +545,8 @@ int main (int argc, char* argv[])
         flagLog += " displayNoiseFloorDb=" + juce::String(displayNoiseFloorDb);
     juce::Logger::writeToLog(flagLog);
 
-    // For this run: enable suspend-on-input so playback stops when the
-    // input exceeds the configured dB threshold. Respect CLI value if provided.
-    app.setMicFadeOnInput(true);
-    if (suspendThresholdDb == suspendThresholdDb) // isnan check
-        app.setMicFadeThresholdDb(suspendThresholdDb);
-    else
-        app.setMicFadeThresholdDb(-20.0); // default
+    // Mic-fade logic disabled: leave playback/gain behavior unchanged.
+    app.setMicFadeOnInput(false);
 
     app.start();
 
