@@ -38,9 +38,7 @@ int main (int argc, char* argv[])
     // local mirrors of flag state for logging
     bool testToneEnabled = false;
     double testToneFreq = 0.0;
-    bool simpleSendEnabled = false;
-    int simpleSendBins = 0;
-    bool interpEnabled = false;
+    // interpolation always enabled by default (no CLI flag)
     bool voiceOnlyEnabled = false;
     double voiceMin = app.getVoiceMinFreq();
     double voiceMax = app.getVoiceMaxFreq();
@@ -52,15 +50,11 @@ int main (int argc, char* argv[])
     bool senderDiag = false;
     bool shufflePlay = false;
     bool autoPlay = false;
-    bool noNoiseFloor = false;
-    double noiseFloorInitVal = -1.0; // negative means keep default
-    double baseNoiseFloorDb = std::numeric_limits<double>::quiet_NaN();
-    bool fixedNoiseFloor = false;
+    // noise-floor flags removed
     double autoPlayThresholdDb = std::numeric_limits<double>::quiet_NaN();
     int autoPlayHoldMs = -1;
     double suspendThresholdDb = std::numeric_limits<double>::quiet_NaN();
     bool forceFeeder = false;
-    bool forceSilence = false;
     double displayNoiseFloorDb = std::numeric_limits<double>::quiet_NaN();
     int autoplayTogglePlayMs = 0;
     int autoplayToggleCycles = -1;
@@ -113,13 +107,7 @@ int main (int argc, char* argv[])
                 app.setTestTone(true, (float)f);
             }
         }
-        else if (arg == "--simple-send" && i + 1 < argc)
-        {
-            int b = std::atoi(argv[++i]);
-            simpleSendEnabled = true;
-            simpleSendBins = b;
-            app.setSimpleSend(true, b);
-        }
+        
         else if (arg == "--sender-interval" && i + 1 < argc)
         {
             int v = std::atoi(argv[++i]);
@@ -244,48 +232,9 @@ int main (int argc, char* argv[])
             rmsEnabled = false;
             app.setUseRMSAggregation(false);
         }
-        else if (arg == "--interp")
-        {
-            interpEnabled = true;
-            app.setInterpMode(true);
-        }
-        else if (arg == "--no-noise-floor")
-        {
-            noNoiseFloor = true;
-            app.setUseNoiseFloor(false);
-        }
-        else if (arg.startsWith("--noise-floor-init="))
-        {
-            double v = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
-            noiseFloorInitVal = v;
-            app.setNoiseFloorInit((float)v);
-        }
-        else if (arg.startsWith("--base-noise-floor="))
-        {
-            // linear amplitude value provided directly
-            double v = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
-            noiseFloorInitVal = v;
-            app.setNoiseFloorInit((float)v);
-        }
-        else if (arg.startsWith("--base-noise-floor-db="))
-        {
-            // dB value: convert to linear amplitude (20*log10 reference)
-            double db = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
-            baseNoiseFloorDb = db;
-            double lin = std::pow(10.0, db / 20.0);
-            noiseFloorInitVal = lin;
-            app.setNoiseFloorInit((float)lin);
-        }
-        else if (arg == "--fixed-noise-floor")
-        {
-            fixedNoiseFloor = true;
-            app.setNoiseFloorFixed(true);
-        }
-        else if (arg == "--force-silence")
-        {
-            forceSilence = true;
-            app.setForceSilence(true);
-        }
+        
+        // --no-noise-floor, --base-noise-floor, and related flags removed
+        // --force-silence removed
         else if (arg == "--force-feeder")
         {
             forceFeeder = true;
@@ -297,12 +246,7 @@ int main (int argc, char* argv[])
             displayNoiseFloorDb = v;
             app.setDisplayNoiseFloorDb(v);
         }
-        else if (arg.startsWith("--fixed-noise-floor="))
-        {
-            int v = arg.fromFirstOccurrenceOf("=", false, false).getIntValue();
-            fixedNoiseFloor = (v != 0);
-            app.setNoiseFloorFixed(fixedNoiseFloor);
-        }
+        // --fixed-noise-floor removed
         else if (arg == "--voice-only")
         {
             voiceOnlyEnabled = true;
@@ -335,10 +279,20 @@ int main (int argc, char* argv[])
             voiceMin = v;
             voiceMinSet = true;
         }
+        else if (arg.startsWith("--voice-min="))
+        {
+            voiceMin = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
+            voiceMinSet = true;
+        }
         else if (arg == "--voice-max" && i + 1 < argc)
         {
             double v = std::atof(argv[++i]);
             voiceMax = v;
+            voiceMaxSet = true;
+        }
+        else if (arg.startsWith("--voice-max="))
+        {
+            voiceMax = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
             voiceMaxSet = true;
         }
         else if (arg == "--map-min" && i + 1 < argc)
@@ -509,8 +463,7 @@ int main (int argc, char* argv[])
     // log active CLI flags so it's obvious what options were used
     juce::String flagLog = "Flags: host=" + host + " port=" + juce::String(port)
         + " testTone=" + (testToneEnabled ? juce::String(testToneFreq) : "off")
-        + " simpleSend=" + (simpleSendEnabled ? juce::String(simpleSendBins) : "off")
-        + " interp=" + (interpEnabled ? "on" : "off")
+        + " interp=on"
         + " voiceOnly=" + (voiceOnlyEnabled ? "on" : "off")
         + " rmsAgg=" + (rmsEnabled ? "on" : "off")
         + " senderDiag=" + (senderDiag ? "on" : "off")
@@ -519,12 +472,6 @@ int main (int argc, char* argv[])
         + " mapMinSet=" + (mapMinSet ? "yes" : "no") + " mapMin=" + juce::String(mapMin)
         + " mapMaxSet=" + (mapMaxSet ? "yes" : "no") + " mapMax=" + juce::String(mapMax);
     // binRange logging removed
-    if (noNoiseFloor)
-        flagLog += " noNoiseFloor=1";
-    if (fixedNoiseFloor)
-        flagLog += " fixedNoiseFloor=1";
-    if (forceSilence)
-        flagLog += " forceSilence=1";
     if (autoPlay)
         flagLog += " autoPlay=1";
     if (forceFeeder)
@@ -537,16 +484,11 @@ int main (int argc, char* argv[])
         flagLog += " autoPlayHoldMs=" + juce::String(autoPlayHoldMs);
     if (shufflePlay)
         flagLog += " shufflePlay=1";
-    if (noiseFloorInitVal >= 0.0)
-        flagLog += " noiseFloorInit=" + juce::String(noiseFloorInitVal);
-    if (std::isfinite(baseNoiseFloorDb))
-        flagLog += " baseNoiseFloorDb=" + juce::String(baseNoiseFloorDb);
     if (std::isfinite(displayNoiseFloorDb))
         flagLog += " displayNoiseFloorDb=" + juce::String(displayNoiseFloorDb);
     juce::Logger::writeToLog(flagLog);
 
-    // Mic-fade logic disabled: leave playback/gain behavior unchanged.
-    app.setMicFadeOnInput(false);
+    // Mic-fade and force-silence features removed.
 
     app.start();
 
