@@ -795,6 +795,25 @@ void FFTOSC::setDisplayNoiseFloorDb(double db)
     juce::Logger::writeToLog("Display noise-floor (min dB) set to " + juce::String(displayMinDb));
 }
 
+void FFTOSC::setHighPassCutoffHz(double hz)
+{
+    if (hz <= 0.0)
+    {
+        hpEnabled = false;
+        juce::Logger::writeToLog("High-pass filter disabled (cutoff <= 0)");
+        return;
+    }
+    hpEnabled = true;
+    hpCutoffHz = hz;
+    if (currentSampleRate > 0.0)
+    {
+        double fs = currentSampleRate;
+        double fc = std::max(0.0, hpCutoffHz);
+        hpAlpha = fs / (fs + 2.0 * M_PI * fc);
+    }
+    juce::Logger::writeToLog("High-pass filter cutoff set to " + juce::String(hpCutoffHz) + " Hz");
+}
+
 // runForcedFadeTest removed
 
 // runForcedFadeResumeTest removed
@@ -839,6 +858,18 @@ void FFTOSC::audioDeviceAboutToStart (juce::AudioIODevice* device)
 
     // prepare transportSource if file playback is enabled
     transportSource.prepareToPlay(512, currentSampleRate);
+
+    // compute high-pass filter alpha for simple 1st-order HP:
+    // alpha = fs / (fs + 2*pi*fc)
+    if (hpEnabled && currentSampleRate > 0.0)
+    {
+        double fs = currentSampleRate;
+        double fc = std::max(0.0, hpCutoffHz);
+        hpAlpha = fs / (fs + 2.0 * M_PI * fc);
+        hpXPrev = 0.0f;
+        hpYPrev = 0.0f;
+        juce::Logger::writeToLog("High-pass filter enabled: cutoff=" + juce::String(hpCutoffHz) + " Hz");
+    }
 }
 
 void FFTOSC::audioDeviceStopped()
@@ -879,6 +910,15 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
         }
         if (numInputChannels > 0)
             micSample /= (float) numInputChannels;
+
+        // apply simple 1st-order high-pass filter to mic input
+        if (hpEnabled)
+        {
+            float y = (float)(hpAlpha * (hpYPrev + micSample - hpXPrev));
+            hpXPrev = micSample;
+            hpYPrev = y;
+            micSample = y;
+        }
 
         // DEBUG: force direct microphone passthrough to outputs for testing
         // This writes the mixed mic sample immediately to all output channels

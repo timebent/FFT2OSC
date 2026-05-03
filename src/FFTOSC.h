@@ -63,6 +63,9 @@ public:
 
     // Adjust display noise-floor (minimum dB used when mapping magnitudes to 0..1)
     void setDisplayNoiseFloorDb(double db);
+    // High-pass filter control
+    void setHighPassCutoffHz(double hz);
+    double getHighPassCutoffHz() const { return hpCutoffHz; }
     // control verbose logging (disable to suppress noisy diagnostics)
     void setVerboseLogging(bool on);
 
@@ -105,12 +108,6 @@ private:
     bool senderDiag = false;
     std::atomic<int> senderDiagCount{0};
 
-    // (noise-floor members removed)
-
-    // (mic-fade members removed)
-
-    // simple synthetic sender (bypass audio/FFT) - removed
-
     juce::OSCSender oscSender;
     juce::String oscHost = "127.0.0.1";
     int oscPort = 57120;
@@ -121,6 +118,12 @@ private:
     float testFreqHz = 440.0f;
     double phase = 0.0;
     double currentSampleRate = 44100.0;
+    // High-pass filter state for microphone input (simple 1st-order HP)
+    double hpCutoffHz = 300.0; // default HP cutoff
+    double hpAlpha = 1.0; // computed from sample rate and cutoff
+    float hpXPrev = 0.0f;
+    float hpYPrev = 0.0f;
+    bool hpEnabled = true;
     // periodic logging for test tone active state
     int testToneLogCounter = 0; // milliseconds accumulated in sender thread
     int testToneLogIntervalMs = 3000; // log once every ~3 seconds when enabled
@@ -128,7 +131,6 @@ private:
     // Use RMS (root-mean-square) aggregation when downsampling FFT bins into visual bands.
     // RMS normalizes for differing numbers of FFT bins per visual band and reflects energy.
     bool useRMSAggregation = true;
-    // (bin-range feature removed)
     double mapMinFreq = 80.0;
     double mapMaxFreq = 24000.0;
     // voice-range filtering: when true, non-voice bins will be zeroed before sending

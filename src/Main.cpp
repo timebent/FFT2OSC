@@ -56,6 +56,8 @@ int main (int argc, char* argv[])
     double suspendThresholdDb = std::numeric_limits<double>::quiet_NaN();
     bool forceFeeder = false;
     double displayNoiseFloorDb = std::numeric_limits<double>::quiet_NaN();
+    double hpCutoff = std::numeric_limits<double>::quiet_NaN();
+    bool hpCutoffSet = false;
     int autoplayTogglePlayMs = 0;
     int autoplayToggleCycles = -1;
     // bin-range flag removed
@@ -245,6 +247,24 @@ int main (int argc, char* argv[])
             double v = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
             displayNoiseFloorDb = v;
             app.setDisplayNoiseFloorDb(v);
+        }
+        else if (arg.startsWith("--hp-cutoff="))
+        {
+            double v = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
+            hpCutoff = v;
+            hpCutoffSet = true;
+        }
+        else if (arg.startsWith("--hpCutoff="))
+        {
+            double v = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
+            hpCutoff = v;
+            hpCutoffSet = true;
+        }
+        else if (arg == "--hp-cutoff" && i + 1 < argc)
+        {
+            double v = std::atof(argv[++i]);
+            hpCutoff = v;
+            hpCutoffSet = true;
         }
         // --fixed-noise-floor removed
         else if (arg == "--voice-only")
@@ -486,7 +506,13 @@ int main (int argc, char* argv[])
         flagLog += " shufflePlay=1";
     if (std::isfinite(displayNoiseFloorDb))
         flagLog += " displayNoiseFloorDb=" + juce::String(displayNoiseFloorDb);
+    if (hpCutoffSet)
+        flagLog += " hpCutoff=" + juce::String(hpCutoff);
     juce::Logger::writeToLog(flagLog);
+
+    // apply HP cutoff if requested from CLI
+    if (hpCutoffSet)
+        app.setHighPassCutoffHz(hpCutoff);
 
     // Mic-fade and force-silence features removed.
 
