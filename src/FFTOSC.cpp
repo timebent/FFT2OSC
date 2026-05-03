@@ -266,7 +266,26 @@ void FFTOSC::senderLoop()
             juce::Logger::writeToLog("SEND ts_ms=" + juce::String((long long)ms) + " cnt=" + juce::String(cnt));
         }
         if (!ok)
-            juce::Logger::writeToLog("OSC send failed (oscSender)");
+        {
+            juce::Logger::writeToLog("OSC send failed (oscSender) - attempting reconnect");
+            // Try a few quick reconnect attempts before giving up for this interval
+            try {
+                oscSender.disconnect();
+            } catch (...) {}
+            bool reconnected = false;
+            for (int attempt = 0; attempt < 3; ++attempt)
+            {
+                if (oscSender.connect(oscHost, oscPort))
+                {
+                    juce::Logger::writeToLog("OSC reconnected to " + oscHost + ":" + juce::String(oscPort));
+                    reconnected = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (!reconnected)
+                juce::Logger::writeToLog("OSC reconnect attempts failed (will retry on next send)");
+        }
         else if (sendLogLimit > 0)
         {
             juce::String s = "Sent /fft/amplitudes count=" + juce::String(outBins) + " first=" + juce::String(sendBins[0]) + " (verbose)";
@@ -851,6 +870,7 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
     // diagnostics: accumulate output energy so we can verify audible output
     static double outSumSquares = 0.0;
     static int outSamplesCount = 0;
+    
     for (int i = 0; i < numSamples; ++i)
     {
         float micSample = 0.0f;
@@ -873,8 +893,6 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
             micSample = y;
         }
 
-        // debug passthrough removed
-
         // accumulate for RMS computation (mic only)
         if (numInputChannels > 0)
             sumSquares += micSample * micSample;
@@ -892,47 +910,48 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
         }
 
         float sample = 0.0f;
-
-        // Select sample source. Mic-driven fade logic removed; prefer playback
-        // when transport and playback buffer are available, otherwise use
-        // test tone if enabled, else fall back to mic input.
-        bool sampleFromPlaybackFlag = false;
-        if (transportPlaying && filePlaybackEnabled && havePlaybackBuf)
-        {
-            sample = playbackSample;
-            sampleFromPlaybackFlag = true;
-        }
-        else if (testToneEnabled.load())
+        // Mix sources instead of choosing one: mic + playback (with playbackGain)
+        // and optional test tone are all summed so both mic and playback are audible.
+        float testSample = 0.0f;
+        if (testToneEnabled.load())
         {
             double inc = 2.0 * M_PI * (double)testFreqHz / currentSampleRate;
-            sample = (float)std::sin(phase);
+            testSample = (float)std::sin(phase);
             phase += inc;
             if (phase > (2.0 * M_PI)) phase -= (2.0 * M_PI);
         }
-        else
-        {
-            sample = micSample;
-        }
+
+        float mixedPlayback = 0.0f;
+        if (transportPlaying && filePlaybackEnabled && havePlaybackBuf)
+            mixedPlayback = playbackSample * playbackGain.load();
+
+        float mixedMic = micSample;
+
+        sample = mixedMic + mixedPlayback + testSample;
+
+        
+
+        // Simply mix sources: mic + playback + test tone are summed directly.
+        // Do not normalize by active source count — keep mixing behavior simple.
+        // Clamping below prevents clipping.
+
+        // simple clamp to avoid clipping
+        if (sample > 1.0f) sample = 1.0f;
+        if (sample < -1.0f) sample = -1.0f;
 
         // write computed sample to outputs if present
         if (outputChannelData != nullptr)
         {
-            // apply playback gain to playback-derived samples so fades are
-            // audible even if transportSource gain isn't taking effect.
-            float outSample = sample;
-            if (sampleFromPlaybackFlag)
-                outSample *= playbackGain.load();
-
             for (int outCh = 0; outCh < numOutputChannels; ++outCh)
             {
                 float* out = outputChannelData[outCh];
                 if (out != nullptr)
                 {
-                    out[i] = outSample;
+                    out[i] = sample;
                 }
             }
             // accumulate output energy for diagnostics
-            outSumSquares += (double)outSample * (double)outSample;
+            outSumSquares += (double)sample * (double)sample;
             ++outSamplesCount;
         }
 
