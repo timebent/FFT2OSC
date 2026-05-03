@@ -2,7 +2,18 @@ cmake_minimum_required(VERSION 3.15)
 project(juce-fft-osc LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 
-find_package(JUCE CONFIG REQUIRED)
+find_package(JUCE CONFIG QUIET)
+
+# If JUCE isn't available on the system, fetch it automatically via FetchContent
+if (NOT JUCE_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(
+        juce
+        GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+        GIT_TAG 8.0.12
+    )
+    FetchContent_MakeAvailable(juce)
+endif()
 
 juce_add_console_app(juce_fft_osc
     PRODUCT_NAME "JUCE FFT OSC"
