@@ -3,3 +3,6 @@ build/
 *.user
 .vscode/
 .idea/
+*.log
+*.pid
+.DS_Store
