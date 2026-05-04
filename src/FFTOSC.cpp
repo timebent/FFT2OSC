@@ -302,6 +302,103 @@ void FFTOSC::senderLoop()
                 testToneLogCounter = 0;
             }
         }
+        // Mic-ducking state machine (runs every sender tick, reliable thread).
+        // Idle:       watch mic; above threshold for micDuckHoldMs → FadingDown
+        // FadingDown: fade to 0 over playbackFadeDurationMs (2s), ignore mic
+        // Holding:    hold at 0 for duckHoldDurationMs (10s); mic re-trigger → FadingDown
+        // FadingUp:   fade to 1 over playbackFadeUpDurationMs (30s); mic re-trigger → FadingDown
+        if (micDuckEnabled && filePlaybackEnabled)
+        {
+            const float eps = 1e-12f;
+            float micLevel = std::max(lastInputRms.load(), lastInputLevel.load());
+            float micDb = (micLevel > eps) ? 20.0f * std::log10f(micLevel) : -120.0f;
+            float currentGain = playbackGain.load();
+            float intervalMs = (float)senderIntervalMs;
+
+            switch (duckState)
+            {
+                case DuckState::Idle:
+                {
+                    if (micDb >= (float)micDuckThresholdDb)
+                    {
+                        micAboveThresholdAccMs += senderIntervalMs;
+                        if (micAboveThresholdAccMs >= micDuckHoldMs)
+                            duckState = DuckState::FadingDown;
+                    }
+                    else
+                    {
+                        micAboveThresholdAccMs = 0;
+                    }
+                    break;
+                }
+                case DuckState::FadingDown:
+                {
+                    float step = (playbackFadeDurationMs > 0)
+                        ? intervalMs / (float)playbackFadeDurationMs : 1.0f;
+                    float newGain = std::max(0.0f, currentGain - step);
+                    playbackGain.store(newGain);
+                    if (newGain == 0.0f)
+                    {
+                        duckHoldAccMs = 0;
+                        duckState = DuckState::Holding;
+                    }
+                    break;
+                }
+                case DuckState::Holding:
+                {
+                    // Check for mic re-trigger; if sustained, restart duck cycle
+                    if (micDb >= (float)micDuckThresholdDb)
+                    {
+                        micAboveThresholdAccMs += senderIntervalMs;
+                        if (micAboveThresholdAccMs >= micDuckHoldMs)
+                        {
+                            micAboveThresholdAccMs = 0;
+                            duckHoldAccMs = 0;
+                            duckState = DuckState::FadingDown;
+                        }
+                    }
+                    else
+                    {
+                        micAboveThresholdAccMs = 0;
+                        duckHoldAccMs += senderIntervalMs;
+                        if (duckHoldAccMs >= duckHoldDurationMs)
+                        {
+                            micAboveThresholdAccMs = 0;
+                            duckState = DuckState::FadingUp;
+                        }
+                    }
+                    break;
+                }
+                case DuckState::FadingUp:
+                {
+                    // Check for mic re-trigger; if sustained, restart duck cycle
+                    if (micDb >= (float)micDuckThresholdDb)
+                    {
+                        micAboveThresholdAccMs += senderIntervalMs;
+                        if (micAboveThresholdAccMs >= micDuckHoldMs)
+                        {
+                            micAboveThresholdAccMs = 0;
+                            duckHoldAccMs = 0;
+                            duckState = DuckState::FadingDown;
+                        }
+                    }
+                    else
+                    {
+                        micAboveThresholdAccMs = 0;
+                        float step = (playbackFadeUpDurationMs > 0)
+                            ? intervalMs / (float)playbackFadeUpDurationMs : 1.0f;
+                        float newGain = std::min(1.0f, currentGain + step);
+                        playbackGain.store(newGain);
+                        if (newGain >= 1.0f)
+                        {
+                            micAboveThresholdAccMs = 0;
+                            duckState = DuckState::Idle;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
         // sleep after sending so the first valid FFT is sent immediately
         std::this_thread::sleep_for(std::chrono::milliseconds(senderIntervalMs));
     }
@@ -430,6 +527,21 @@ void FFTOSC::setUseRMSAggregation(bool on)
     juce::Logger::writeToLog(juce::String("RMS aggregation ") + (on ? "enabled" : "disabled"));
 }
 // noise-floor API removed
+
+void FFTOSC::setMicDuckEnabled(bool on)
+{
+    micDuckEnabled = on;
+    if (!on)
+        playbackGain.store(1.0f); // restore full gain when feature is disabled
+    juce::Logger::writeToLog(juce::String("Mic-ducking ") + (on ? "enabled" : "disabled")
+                             + " threshold=" + juce::String(micDuckThresholdDb) + " dBFS");
+}
+
+void FFTOSC::setMicDuckThresholdDb(double db)
+{
+    micDuckThresholdDb = db;
+    juce::Logger::writeToLog("Mic-duck threshold set to " + juce::String(db) + " dBFS");
+}
 
 // setForceSilence removed
 
@@ -893,6 +1005,11 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
             micSample = y;
         }
 
+        // track peak absolute level for lastInputLevel (used by mic-ducking)
+        float absMic = std::abs(micSample);
+        if (absMic > maxAbsMic)
+            maxAbsMic = absMic;
+
         // accumulate for RMS computation (mic only)
         if (numInputChannels > 0)
             sumSquares += micSample * micSample;
@@ -1083,8 +1200,8 @@ void FFTOSC::timerCallback()
             if (v > peak) peak = v;
         }
 
-        // Mic-driven fade logic removed: playbackGain is unchanged here.
-        (void) micLevel; // keep variable used
+        // Mic-ducking is handled in senderLoop; nothing to do here.
+        (void) micLevel;
     }
     // (manual resume paths removed - no automatic/manual resume on mic inactivity)
     // handle any requested next-file events from audio thread

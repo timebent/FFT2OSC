@@ -42,6 +42,12 @@ public:
     void setUseRMSAggregation(bool on);
     bool getUseRMSAggregation() const;
     // (per-band noise-floor processing removed)
+    // Mic-ducking: fade playback gain to zero when mic RMS/peak exceeds a dBFS threshold.
+    // Fade speed is controlled by playbackFadeDurationMs (down) and playbackFadeUpDurationMs (up).
+    void setMicDuckEnabled(bool on);
+    void setMicDuckThresholdDb(double db);
+    bool getMicDuckEnabled() const { return micDuckEnabled; }
+    double getMicDuckThresholdDb() const { return micDuckThresholdDb; }
     // Auto-playback controls
     void setAutoPlayback(bool on);
     void setAutoPlayThresholdDb(double db);
@@ -196,12 +202,22 @@ private:
     std::atomic<float> playbackGain{1.0f};
     float playbackFadeDownGain = 0.0f; // target gain when mic active (fade to silence)
     int playbackFadeDurationMs = 2000; // duration of fade-down in ms (2s)
-    int playbackFadeUpDurationMs = 5000; // duration of fade-up (resume) in ms (5s)
+    int playbackFadeUpDurationMs = 30000; // duration of fade-up (resume) in ms (30s)
     // grace period in milliseconds after starting playback during which mic
     // activity will be ignored to avoid immediately stopping newly-started files.
     // Set to 0 to disable startup suppression.
     int playbackStartupGraceMs = 0;
     void setPlaybackStartupGraceMs(int ms) { if (ms >= 0) playbackStartupGraceMs = ms; }
+    // Mic-ducking state machine
+    // Idle → (500ms above threshold) → FadingDown (2s) → Holding (10s) → FadingUp (30s) → Idle
+    enum class DuckState { Idle, FadingDown, Holding, FadingUp };
+    bool micDuckEnabled = false;
+    double micDuckThresholdDb = -40.0; // dBFS; overridden by setMicDuckThresholdDb
+    int micDuckHoldMs = 500;           // ms above threshold before duck triggers
+    int micAboveThresholdAccMs = 0;    // accumulated ms above threshold (sender-thread only)
+    int duckHoldDurationMs = 10000;    // ms to hold silence before fading back up
+    int duckHoldAccMs = 0;             // accumulated ms at silence
+    DuckState duckState = DuckState::Idle;
 
     // Audio gate and mic-fade logic removed.
 

@@ -214,7 +214,8 @@ int main (int argc, char* argv[])
         {
             double v = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
             suspendThresholdDb = v;
-            juce::Logger::writeToLog("--suspend-threshold-db ignored: mic-fade disabled in this build");
+            app.setMicDuckThresholdDb(v);
+            app.setMicDuckEnabled(true);
         }
         else if (arg.startsWith("--auto-play-hold-ms="))
         {
