@@ -1,9 +1,4 @@
 #include "FFTOSC.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <errno.h>
 #include <cstring>
 #include <cmath>
 #include <random>
@@ -22,29 +17,7 @@ FFTOSC::FFTOSC()
     else
         juce::Logger::writeToLog("OSC connect failed to " + oscHost + ":" + juce::String(oscPort));
 
-    // setup raw UDP debug socket
-    debugSock = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (debugSock >= 0)
-    {
-        std::memset(&debugAddr, 0, sizeof(debugAddr));
-        debugAddr.sin_family = AF_INET;
-        debugAddr.sin_port = htons((uint16_t) oscPort);
-        if (inet_pton(AF_INET, oscHost.toRawUTF8(), &debugAddr.sin_addr) == 1)
-        {
-            debugSockValid = true;
-            juce::Logger::writeToLog("Debug UDP socket opened to " + oscHost + ":" + juce::String(oscPort));
-        }
-        else
-        {
-            ::close(debugSock);
-            debugSock = -1;
-            juce::Logger::writeToLog("Debug UDP socket: invalid host");
-        }
-    }
-    else
-    {
-        juce::Logger::writeToLog("Debug UDP socket creation failed: " + juce::String(std::strerror(errno)));
-    }
+    // raw debug UDP socket removed; rely on juce::OSCSender for emission
 
     formatManager.registerBasicFormats();
 }
@@ -67,7 +40,7 @@ void FFTOSC::senderLoop()
 {
     while (senderRunning.load())
     {
-        // copy latest amplitudes or generate synthetic bins when in simple-send mode
+        // copy latest amplitudes
         std::vector<float> sendBins;
         sendBins.reserve(outBins);
         float globalMax = 0.0f;
@@ -75,31 +48,6 @@ void FFTOSC::senderLoop()
         int nonZeroCount = 0;
         int expectedBin = -1;
 
-        if (simpleSendEnabled.load())
-        {
-            // generate synthetic band array: single active band (or sweep if band out of range)
-            sendBins.assign(outBins, 0.0f);
-            int band = simpleSendBand.load();
-            if (band < 0 || band >= outBins)
-            {
-                int b = (int)std::floor(simpleSweepPos) % outBins;
-                sendBins[b] = 1.0f;
-                simpleSweepPos += 1.0;
-                if (simpleSweepPos >= outBins) simpleSweepPos -= outBins;
-                globalMax = 1.0f;
-                globalMaxIndex = b;
-                nonZeroCount = 1;
-            }
-            else
-            {
-                sendBins[band] = 1.0f;
-                globalMax = 1.0f;
-                globalMaxIndex = band;
-                nonZeroCount = 1;
-            }
-            // no FFT inputs, expectedBin is N/A here (we're sending bands directly)
-        }
-        else
         {
             // copy latest amplitudes
             std::vector<float> ampsCopy;
@@ -140,19 +88,8 @@ void FFTOSC::senderLoop()
                 edges.reserve(outBins + 1);
                 double logMin = std::log(1.0);
                 double logMax = std::log((double)total);
-                if (!interpMode)
-                {
-                    edges.push_back(0);
-                    for (int k = 1; k < outBins; ++k)
-                    {
-                        double t = (double)k / (double)outBins;
-                        int idx = (int)std::floor(std::exp(logMin + (logMax - logMin) * t));
-                        if (idx < 1) idx = 1;
-                        if (idx > (int)total - 1) idx = (int)total - 1;
-                        edges.push_back(idx);
-                    }
-                    edges.push_back((int)total);
-                }
+                // Use fractional-bin interpolation to sample amplitudes at
+                // log-spaced target frequencies (always enabled).
 
                 // compute global peak and count of non-zero bins (before downsampling)
                 const float zeroEps = 1e-9f;
@@ -168,35 +105,8 @@ void FFTOSC::senderLoop()
                         ++nonZeroCount;
                 }
 
-                if (!interpMode)
-                {
-                    // Aggregate FFT bins into output visual bands.
-                    for (int b = 0; b < outBins; ++b)
-                    {
-                        int start = edges[b];
-                        int end = edges[b+1];
-                        if (start >= (int)total) { sendBins.push_back(0.0f); continue; }
-                        end = std::min(end, (int)total);
-                        int count = end - start;
-                        if (count <= 0)
-                        {
-                            sendBins.push_back(0.0f);
-                            continue;
-                        }
-                        double sumSq = 0.0;
-                        for (int i = start; i < end; ++i)
-                        {
-                            float v = ampsCopy[(size_t)i];
-                            if (!std::isfinite(v) || v <= 0.0f)
-                                v = 0.0f;
-                            sumSq += (double)v * (double)v;
-                        }
-                        double meanSq = sumSq / (double)count;
-                        float rms = (float)std::sqrt(meanSq);
-                        sendBins.push_back(rms);
-                    }
-                }
-                else
+                // Always use interpolation: sample fractional FFT bins at
+                // log-spaced target frequencies and push interpolated values.
                 {
                     double logRange = std::log10(mapMaxFreq / mapMinFreq);
                     for (int b = 0; b < outBins; ++b)
@@ -216,6 +126,8 @@ void FFTOSC::senderLoop()
                         float interp = (float)(v0 + frac * (v1 - v0));
                         sendBins.push_back(interp);
                     }
+    // File-feeder feature removed: if no outputs are available, playback
+    // will be silent. Users may enable file playback only when outputs exist.
                 }
 
                 if (testToneEnabled.load() && currentSampleRate > 0.0)
@@ -228,7 +140,7 @@ void FFTOSC::senderLoop()
 
         // sanitize and scale magnitudes, then convert to dB and normalize to 0..1
         const float eps = 1e-12f;
-        const float minDb = -80.0f;
+        const float minDb = displayMinDb;
         const float maxDb = 0.0f;
         const float maxReasonable = 1e12f; // clamp extreme values
         const float scale = (fftSize > 0) ? (1.0f / (float) fftSize) : 1.0f;
@@ -250,45 +162,7 @@ void FFTOSC::senderLoop()
         // noise-floor subtraction and dB normalization cannot re-introduce
         // energy into bands outside the requested voice range.)
 
-        // initialize noise floor vector to match sendBins size; allow fixed-or-adaptive modes
-        if (useNoiseFloor)
-        {
-            if (noiseFloorFixed)
-            {
-                // Fixed floor: subtract the configured init value from every band
-                for (size_t i = 0; i < sendBins.size(); ++i)
-                {
-                    float mag = sendBins[i];
-                    if (!std::isfinite(mag)) mag = 0.0f;
-                    float sub = mag - noiseFloorInit;
-                    if (!std::isfinite(sub) || sub <= 0.0f)
-                        sendBins[i] = 0.0f;
-                    else
-                        sendBins[i] = sub;
-                }
-            }
-            else
-            {
-                if (noiseFloor.size() != sendBins.size())
-                    noiseFloor.assign(sendBins.size(), noiseFloorInit);
-
-                for (size_t i = 0; i < sendBins.size(); ++i)
-                {
-                    float mag = sendBins[i];
-                    if (!std::isfinite(mag)) mag = 0.0f;
-                    if (mag < noiseFloor[i])
-                        noiseFloor[i] = noiseFloorAttack * mag + (1.0f - noiseFloorAttack) * noiseFloor[i];
-                    else
-                        noiseFloor[i] = noiseFloorRelease * noiseFloor[i] + (1.0f - noiseFloorRelease) * mag;
-
-                    float sub = mag - noiseFloor[i];
-                    if (!std::isfinite(sub) || sub <= 0.0f)
-                        sendBins[i] = 0.0f;
-                    else
-                        sendBins[i] = sub;
-                }
-            }
-        }
+        // (noise-floor subtraction removed)
 
         if (sendLogLimit > 0)
         {
@@ -392,7 +266,26 @@ void FFTOSC::senderLoop()
             juce::Logger::writeToLog("SEND ts_ms=" + juce::String((long long)ms) + " cnt=" + juce::String(cnt));
         }
         if (!ok)
-            juce::Logger::writeToLog("OSC send failed (oscSender)");
+        {
+            juce::Logger::writeToLog("OSC send failed (oscSender) - attempting reconnect");
+            // Try a few quick reconnect attempts before giving up for this interval
+            try {
+                oscSender.disconnect();
+            } catch (...) {}
+            bool reconnected = false;
+            for (int attempt = 0; attempt < 3; ++attempt)
+            {
+                if (oscSender.connect(oscHost, oscPort))
+                {
+                    juce::Logger::writeToLog("OSC reconnected to " + oscHost + ":" + juce::String(oscPort));
+                    reconnected = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (!reconnected)
+                juce::Logger::writeToLog("OSC reconnect attempts failed (will retry on next send)");
+        }
         else if (sendLogLimit > 0)
         {
             juce::String s = "Sent /fft/amplitudes count=" + juce::String(outBins) + " first=" + juce::String(sendBins[0]) + " (verbose)";
@@ -407,6 +300,103 @@ void FFTOSC::senderLoop()
             {
                 juce::Logger::writeToLog("Test tone active freq=" + juce::String(testFreqHz));
                 testToneLogCounter = 0;
+            }
+        }
+        // Mic-ducking state machine (runs every sender tick, reliable thread).
+        // Idle:       watch mic; above threshold for micDuckHoldMs → FadingDown
+        // FadingDown: fade to 0 over playbackFadeDurationMs (2s), ignore mic
+        // Holding:    hold at 0 for duckHoldDurationMs (10s); mic re-trigger → FadingDown
+        // FadingUp:   fade to 1 over playbackFadeUpDurationMs (30s); mic re-trigger → FadingDown
+        if (micDuckEnabled && filePlaybackEnabled)
+        {
+            const float eps = 1e-12f;
+            float micLevel = std::max(lastInputRms.load(), lastInputLevel.load());
+            float micDb = (micLevel > eps) ? 20.0f * std::log10f(micLevel) : -120.0f;
+            float currentGain = playbackGain.load();
+            float intervalMs = (float)senderIntervalMs;
+
+            switch (duckState)
+            {
+                case DuckState::Idle:
+                {
+                    if (micDb >= (float)micDuckThresholdDb)
+                    {
+                        micAboveThresholdAccMs += senderIntervalMs;
+                        if (micAboveThresholdAccMs >= micDuckHoldMs)
+                            duckState = DuckState::FadingDown;
+                    }
+                    else
+                    {
+                        micAboveThresholdAccMs = 0;
+                    }
+                    break;
+                }
+                case DuckState::FadingDown:
+                {
+                    float step = (playbackFadeDurationMs > 0)
+                        ? intervalMs / (float)playbackFadeDurationMs : 1.0f;
+                    float newGain = std::max(0.0f, currentGain - step);
+                    playbackGain.store(newGain);
+                    if (newGain == 0.0f)
+                    {
+                        duckHoldAccMs = 0;
+                        duckState = DuckState::Holding;
+                    }
+                    break;
+                }
+                case DuckState::Holding:
+                {
+                    // Check for mic re-trigger; if sustained, restart duck cycle
+                    if (micDb >= (float)micDuckThresholdDb)
+                    {
+                        micAboveThresholdAccMs += senderIntervalMs;
+                        if (micAboveThresholdAccMs >= micDuckHoldMs)
+                        {
+                            micAboveThresholdAccMs = 0;
+                            duckHoldAccMs = 0;
+                            duckState = DuckState::FadingDown;
+                        }
+                    }
+                    else
+                    {
+                        micAboveThresholdAccMs = 0;
+                        duckHoldAccMs += senderIntervalMs;
+                        if (duckHoldAccMs >= duckHoldDurationMs)
+                        {
+                            micAboveThresholdAccMs = 0;
+                            duckState = DuckState::FadingUp;
+                        }
+                    }
+                    break;
+                }
+                case DuckState::FadingUp:
+                {
+                    // Check for mic re-trigger; if sustained, restart duck cycle
+                    if (micDb >= (float)micDuckThresholdDb)
+                    {
+                        micAboveThresholdAccMs += senderIntervalMs;
+                        if (micAboveThresholdAccMs >= micDuckHoldMs)
+                        {
+                            micAboveThresholdAccMs = 0;
+                            duckHoldAccMs = 0;
+                            duckState = DuckState::FadingDown;
+                        }
+                    }
+                    else
+                    {
+                        micAboveThresholdAccMs = 0;
+                        float step = (playbackFadeUpDurationMs > 0)
+                            ? intervalMs / (float)playbackFadeUpDurationMs : 1.0f;
+                        float newGain = std::min(1.0f, currentGain + step);
+                        playbackGain.store(newGain);
+                        if (newGain >= 1.0f)
+                        {
+                            micAboveThresholdAccMs = 0;
+                            duckState = DuckState::Idle;
+                        }
+                    }
+                    break;
+                }
             }
         }
         // sleep after sending so the first valid FFT is sent immediately
@@ -428,29 +418,7 @@ FFTOSC::FFTOSC(const juce::String& host, int port)
     else
         juce::Logger::writeToLog("OSC connect failed to " + oscHost + ":" + juce::String(oscPort));
 
-    // setup raw UDP debug socket
-    debugSock = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (debugSock >= 0)
-    {
-        std::memset(&debugAddr, 0, sizeof(debugAddr));
-        debugAddr.sin_family = AF_INET;
-        debugAddr.sin_port = htons((uint16_t) oscPort);
-        if (inet_pton(AF_INET, oscHost.toRawUTF8(), &debugAddr.sin_addr) == 1)
-        {
-            debugSockValid = true;
-            juce::Logger::writeToLog("Debug UDP socket opened to " + oscHost + ":" + juce::String(oscPort));
-        }
-        else
-        {
-            ::close(debugSock);
-            debugSock = -1;
-            juce::Logger::writeToLog("Debug UDP socket: invalid host");
-        }
-    }
-    else
-    {
-        juce::Logger::writeToLog("Debug UDP socket creation failed: " + juce::String(std::strerror(errno)));
-    }
+    // raw debug UDP socket removed; rely on juce::OSCSender for emission
     formatManager.registerBasicFormats();
 }
 
@@ -459,8 +427,17 @@ void FFTOSC::setTestTone(bool enabled, float freqHz)
     testToneEnabled.store(enabled);
     if (freqHz > 0.0f)
         testFreqHz = freqHz;
-    juce::Logger::writeToLog("Test tone " + juce::String(enabled ? "enabled" : "disabled") + 
-                             " freq=" + juce::String(testFreqHz));
+    if (verboseLogging)
+        juce::Logger::writeToLog("Test tone " + juce::String(enabled ? "enabled" : "disabled") + 
+                                 " freq=" + juce::String(testFreqHz));
+}
+
+void FFTOSC::setVerboseLogging(bool on)
+{
+    verboseLogging = on;
+    // Log the state change (useful even when enabling only once)
+    if (verboseLogging)
+        juce::Logger::writeToLog("Verbose logging enabled");
 }
 
 void FFTOSC::setPlaybackFiles(const std::vector<juce::String>& paths)
@@ -474,10 +451,10 @@ void FFTOSC::setPlaybackFiles(const std::vector<juce::String>& paths)
         else
             juce::Logger::writeToLog("Playback file not found: " + p);
     }
-    // reset urn so nextFileRequested will trigger fresh selection
+    // reset urn; do not auto-request playback on file list changes
     urnIndices.clear();
     sequentialIndex = 0;
-    nextFileRequested.store(!playbackFiles.empty());
+    nextFileRequested.store(false);
 }
 
 void FFTOSC::setFilePlaybackEnabled(bool on)
@@ -490,23 +467,43 @@ void FFTOSC::setFilePlaybackEnabled(bool on)
     }
     else
     {
-        nextFileRequested.store(!playbackFiles.empty());
+        // If we enabled playback at runtime but the audio device was
+        // previously opened without output channels, make sure outputs
+        // are initialized so the transport actually produces sound.
+        auto* dev = deviceManager.getCurrentAudioDevice();
+        bool needReinit = false;
+        if (dev == nullptr)
+            needReinit = true;
+        else if (dev->getActiveOutputChannels().countNumberOfSetBits() == 0)
+            needReinit = true;
+        if (needReinit)
+        {
+            int numInputs = 1;
+            int numOutputs = 2; // stereo output for file playback
+            deviceManager.initialiseWithDefaultDevices(numInputs, numOutputs);
+            deviceManager.addAudioCallback(this);
+            juce::Logger::writeToLog("File playback: initialized audio outputs (stereo)");
+        }
+        // Do not auto-request playback when enabling file playback; require explicit start
     }
     juce::Logger::writeToLog(juce::String("File playback ") + (on ? "enabled" : "disabled"));
+
+    // File-feeder feature removed: when no OS outputs are available,
+    // file playback will be silent. No background feeder thread is spawned.
+
+    // If we've just enabled file playback and we have files available but
+    // no reader is currently set, request the playback thread to start the
+    // next file. This does not re-introduce automatic resume logic on
+    // mic inactivity — it simply starts the initial file when the user
+    // explicitly enables playback (e.g. via --play-dir or --play-files).
+    if (on && !playbackFiles.empty() && readerSource == nullptr)
+    {
+        nextFileRequested.store(true);
+        juce::Logger::writeToLog("File playback enabled: requesting start of first file");
+    }
 }
 
-void FFTOSC::setSimpleSend(bool enabled, int bandIndex)
-{
-    simpleSendEnabled.store(enabled);
-    simpleSendBand.store(bandIndex);
-    juce::Logger::writeToLog("Simple send " + juce::String(enabled ? "enabled" : "disabled") + " band=" + juce::String(bandIndex));
-}
-
-void FFTOSC::setInterpMode(bool enabled)
-{
-    interpMode = enabled;
-    juce::Logger::writeToLog("Interpolation mode " + juce::String(enabled ? "enabled" : "disabled"));
-}
+// fractional-bin interpolation is always enabled; setInterpMode removed
 
 void FFTOSC::setSenderIntervalMs(int ms)
 {
@@ -529,31 +526,24 @@ void FFTOSC::setUseRMSAggregation(bool on)
     useRMSAggregation = on;
     juce::Logger::writeToLog(juce::String("RMS aggregation ") + (on ? "enabled" : "disabled"));
 }
+// noise-floor API removed
 
-void FFTOSC::setUseNoiseFloor(bool on)
+void FFTOSC::setMicDuckEnabled(bool on)
 {
-    useNoiseFloor = on;
-    juce::Logger::writeToLog(juce::String("Noise floor ") + (on ? "enabled" : "disabled"));
-    if (!useNoiseFloor)
-        noiseFloor.clear();
+    micDuckEnabled = on;
+    if (!on)
+        playbackGain.store(1.0f); // restore full gain when feature is disabled
+    juce::Logger::writeToLog(juce::String("Mic-ducking ") + (on ? "enabled" : "disabled")
+                             + " threshold=" + juce::String(micDuckThresholdDb) + " dBFS");
 }
 
-void FFTOSC::setNoiseFloorInit(float initVal)
+void FFTOSC::setMicDuckThresholdDb(double db)
 {
-    noiseFloorInit = initVal;
-    juce::Logger::writeToLog("Noise floor init set to " + juce::String(noiseFloorInit));
-    // if floor vector exists, reinit
-    if (!noiseFloor.empty())
-        std::fill(noiseFloor.begin(), noiseFloor.end(), noiseFloorInit);
+    micDuckThresholdDb = db;
+    juce::Logger::writeToLog("Mic-duck threshold set to " + juce::String(db) + " dBFS");
 }
 
-void FFTOSC::setNoiseFloorFixed(bool on)
-{
-    noiseFloorFixed = on;
-    juce::Logger::writeToLog(juce::String("Noise floor fixed mode ") + (on ? "enabled" : "disabled"));
-    if (on)
-        noiseFloor.clear();
-}
+// setForceSilence removed
 
 // bin-range feature removed
 
@@ -591,30 +581,37 @@ void FFTOSC::setVoiceRange(double minFreq, double maxFreq)
 FFTOSC::~FFTOSC()
 {
     stop();
-    if (debugSockValid && debugSock >= 0)
-        ::close(debugSock);
 }
 
 void FFTOSC::start()
 {
-    if (!simpleSendEnabled.load())
+    // Initialize audio device
+    // If a test tone is enabled, request both input and outputs so mic+tone work together
+    int numInputs = 1;
+    // Request stereo outputs by default so microphone passthrough is audible
+    int numOutputs = 2;
+    if (testToneEnabled.load())
+        numOutputs = 2;
+    // If file playback is enabled we need output channels so the audio callback
+    // runs and `transportSource.getNextAudioBlock()` is called to advance files.
+    if (filePlaybackEnabled)
+        numOutputs = std::max(numOutputs, 2);
+    deviceManager.initialiseWithDefaultDevices(numInputs, numOutputs);
+    deviceManager.addAudioCallback(this);
     {
-        // If a test tone is enabled, request both input and outputs so mic+tone work together
-        int numInputs = 1;
-        int numOutputs = 0;
-        if (testToneEnabled.load())
-            numOutputs = 2;
-        // If file playback is enabled we need output channels so the audio callback
-        // runs and `transportSource.getNextAudioBlock()` is called to advance files.
-        if (filePlaybackEnabled)
-            numOutputs = std::max(numOutputs, 2);
-        deviceManager.initialiseWithDefaultDevices(numInputs, numOutputs);
-        deviceManager.addAudioCallback(this);
-    }
+        auto* dev = deviceManager.getCurrentAudioDevice();
+        if (dev != nullptr)
+        {
+            juce::Logger::writeToLog("Audio device init: " + dev->getName()
+                                     + " rate=" + juce::String(dev->getCurrentSampleRate())
+                                     + " inputs=" + juce::String(dev->getActiveInputChannels().countNumberOfSetBits())
+                                     + " outputs=" + juce::String(dev->getActiveOutputChannels().countNumberOfSetBits()));
+        }
         else
         {
-            juce::Logger::writeToLog("Simple sender enabled: skipping audio device init");
+            juce::Logger::writeToLog("Audio device init: no device returned by deviceManager");
         }
+    }
 
     // start background sender thread
     senderRunning.store(true);
@@ -623,36 +620,8 @@ void FFTOSC::start()
     startTimer(50); // 50 ms interval
     // print band centers so user can see which visual bins map to which frequencies
     logBandCenters();
-    // If file playback was enabled before start, try to kick off the first file immediately
-    if (filePlaybackEnabled && !playbackFiles.empty())
-    {
-        // try each file until one successfully opens
-        bool openedAny = false;
-        for (int idx = 0; idx < (int)playbackFiles.size(); ++idx)
-        {
-            juce::File f = playbackFiles[(size_t)idx];
-            std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(f));
-            if (reader)
-            {
-                currentFileIndex = idx;
-                readerSource.reset(new juce::AudioFormatReaderSource(reader.release(), true));
-                transportSource.setSource(readerSource.get(), 0, nullptr, readerSource->getAudioFormatReader()->sampleRate);
-                transportSource.start();
-                juce::Logger::writeToLog("Started playback: " + f.getFullPathName());
-                openedAny = true;
-                break;
-            }
-            else
-            {
-                juce::Logger::writeToLog("Failed to open playback file: " + f.getFullPathName());
-            }
-        }
-        if (openedAny)
-        {
-            // clear any pending automatic request so timerCallback doesn't immediately open
-            nextFileRequested.store(false);
-        }
-    }
+    // Automatic start/resume at startup removed: playback will not be started
+    // implicitly. Use explicit control to start playback when desired.
     // start playback thread to monitor transport and advance files
     playbackThreadRunning.store(true);
     playbackThread = std::thread([this]() {
@@ -665,7 +634,7 @@ void FFTOSC::start()
                 bool playing = transportSource.isPlaying();
                 if (len > 0.0 && !playing && pos >= (len - 0.05) && pos > 0.01)
                 {
-                    juce::Logger::writeToLog("playbackThread: detected EOF pos=" + juce::String(pos) + " len=" + juce::String(len));
+                    if (verboseLogging) juce::Logger::writeToLog("playbackThread: detected EOF pos=" + juce::String(pos) + " len=" + juce::String(len));
                     // start next file under playbackMutex to avoid races
                     std::lock_guard<std::mutex> lg(playbackMutex);
                     if (!playbackFiles.empty())
@@ -678,12 +647,20 @@ void FFTOSC::start()
                                 urnIndices.reserve((int)playbackFiles.size());
                                 for (int i = 0; i < (int)playbackFiles.size(); ++i)
                                     urnIndices.push_back(i);
+                                // 32‑bit Mersenne Twister pseudo‑random engine (a PRNG implementation).
                                 std::random_device rd;
                                 std::mt19937 g(rd());
+                                
                                 std::shuffle(urnIndices.begin(), urnIndices.end(), g);
                             }
                             if (currentFileIndex >= 0 && urnIndices.size() > 1)
-                                urnIndices.erase(std::remove(urnIndices.begin(), urnIndices.end(), currentFileIndex), urnIndices.end());
+                                urnIndices.erase(
+                                    // move the item item at currentFileIndex to the end 
+                                    // return an iterator that points to the new end of the range after removing currentFileIndex
+                                    std::remove(urnIndices.begin(), urnIndices.end(), currentFileIndex), 
+                                   // get the end of the range. This should always be 1 since we are eliminating single items.
+                                    urnIndices.end());
+                            // draw an item from the urn and remove it.
                             idx = urnIndices.back();
                             urnIndices.pop_back();
                         }
@@ -701,11 +678,21 @@ void FFTOSC::start()
                             transportSource.stop();
                             transportSource.setSource(nullptr);
                             readerSource.reset(new juce::AudioFormatReaderSource(reader.release(), true));
+                            if (readerSource) readerSource->setNextReadPosition(0);
                             currentFileLengthSeconds = (double)readerSource->getTotalLength() / readerSource->getAudioFormatReader()->sampleRate;
                             transportSource.setSource(readerSource.get(), 0, nullptr, readerSource->getAudioFormatReader()->sampleRate);
+                            transportSource.setPosition(0.0);
                             transportSource.start();
+                            // keep transportSource internal gain at unity; audio callback
+                            // applies `playbackGain` so we don't multiply gain twice.
+                            transportSource.setGain(1.0f);
+                            {
+                                auto now = std::chrono::steady_clock::now();
+                                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+                                lastPlaybackStartMs.store((long long)ms);
+                            }
                             currentFileIndex = idx;
-                            juce::Logger::writeToLog("playbackThread: Started playback: " + f.getFullPathName());
+                            if (verboseLogging) juce::Logger::writeToLog("playbackThread: Started playback: " + f.getFullPathName());
                         }
                         else
                         {
@@ -714,10 +701,183 @@ void FFTOSC::start()
                     }
                 }
             }
+
+            // Observe any external requests to start the next file (e.g. from audio thread)
+            if (nextFileRequested.exchange(false))
+            {
+                if (verboseLogging) juce::Logger::writeToLog("playbackThread: nextFileRequested observed");
+                // start next file under playbackMutex to avoid races
+                std::lock_guard<std::mutex> lg(playbackMutex);
+                if (!playbackFiles.empty())
+                {
+                    int idx = 0;
+                    if (shufflePlayback)
+                    {
+                        if (urnIndices.empty())
+                        {
+                            urnIndices.reserve((int)playbackFiles.size());
+                            for (int i = 0; i < (int)playbackFiles.size(); ++i)
+                                urnIndices.push_back(i);
+                            std::random_device rd;
+                            std::mt19937 g(rd());
+                            std::shuffle(urnIndices.begin(), urnIndices.end(), g);
+                        }
+                        // avoid reselecting currently playing file if possible
+                        if (currentFileIndex >= 0 && urnIndices.size() > 1)
+                            urnIndices.erase(std::remove(urnIndices.begin(), urnIndices.end(), currentFileIndex), urnIndices.end());
+                        idx = urnIndices.back();
+                        urnIndices.pop_back();
+                    }
+                    else
+                    {
+                        if (sequentialIndex < 0) sequentialIndex = 0;
+                        if (sequentialIndex >= (int)playbackFiles.size()) sequentialIndex = 0;
+                        idx = sequentialIndex;
+                        sequentialIndex = (sequentialIndex + 1) % (int)playbackFiles.size();
+                    }
+                    currentFileIndex = idx;
+                    juce::File f = playbackFiles[(size_t)idx];
+                    std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(f));
+                    if (reader)
+                    {
+                        transportSource.stop();
+                        transportSource.setSource(nullptr);
+                        readerSource.reset(new juce::AudioFormatReaderSource(reader.release(), true));
+                        if (readerSource) readerSource->setNextReadPosition(0);
+                        currentFileLengthSeconds = (double)readerSource->getTotalLength() / readerSource->getAudioFormatReader()->sampleRate;
+                        transportSource.setSource(readerSource.get(), 0, nullptr, readerSource->getAudioFormatReader()->sampleRate);
+                        transportSource.setPosition(0.0);
+                        transportSource.start();
+                        // keep transportSource internal gain at unity; audio callback
+                        // applies `playbackGain` so we don't multiply gain twice.
+                        transportSource.setGain(1.0f);
+                        {
+                            auto now = std::chrono::steady_clock::now();
+                            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+                            lastPlaybackStartMs.store((long long)ms);
+                        }
+                        if (verboseLogging) juce::Logger::writeToLog("playbackThread: Started playback (requested): " + f.getFullPathName());
+                    }
+                    else
+                    {
+                        juce::Logger::writeToLog("playbackThread: Failed to open playback file: " + f.getFullPathName());
+                    }
+                }
+            }
+
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     });
 }
+
+void FFTOSC::setAutoPlayback(bool on)
+{
+    juce::Logger::writeToLog("Auto-playback request ignored: automatic resume/start removed");
+}
+
+void FFTOSC::setAutoPlayThresholdDb(double db)
+{
+    juce::Logger::writeToLog("Ignored setAutoPlayThresholdDb(" + juce::String(db) + "): auto-playback removed");
+}
+
+// mic-fade setters removed
+
+void FFTOSC::setAutoPlayHoldMs(int ms)
+{
+    juce::Logger::writeToLog("Ignored setAutoPlayHoldMs(" + juce::String(ms) + "): auto-playback removed");
+}
+
+// Force-file-feeder API removed: keep a no-op stub for compatibility
+void FFTOSC::setForceFileFeeder(bool on)
+{
+    juce::Logger::writeToLog("Ignored setForceFileFeeder(" + juce::String(on ? "true" : "false") + "): feature removed");
+}
+
+void FFTOSC::startAutoplayToggleTest(int playMs, int cycles)
+{
+    // stop existing test if running
+    stopAutoplayToggleTest();
+    if (playMs <= 0) playMs = 1000;
+    autoplayTestRunning.store(true);
+    autoplayTestThread = std::thread([this, playMs, cycles]() {
+        int iter = 0;
+        while (autoplayTestRunning.load())
+        {
+            // enable playback
+            setFilePlaybackEnabled(true);
+            int slept = 0;
+            while (autoplayTestRunning.load() && slept < playMs)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                slept += 50;
+            }
+            if (!autoplayTestRunning.load()) break;
+            // disable playback => return to mic input
+            setFilePlaybackEnabled(false);
+            // re-enable mic-driven fade if it was desired by user (leave disabled here)
+            int slept2 = 0;
+            while (autoplayTestRunning.load() && slept2 < playMs)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                slept2 += 50;
+            }
+            if (cycles > 0)
+            {
+                ++iter;
+                if (iter >= cycles) break;
+            }
+        }
+        // ensure playback is left disabled at end of test
+        setFilePlaybackEnabled(false);
+        autoplayTestRunning.store(false);
+    });
+    juce::Logger::writeToLog("Autoplay-toggle test started: " + juce::String(playMs) + "ms per state, cycles=" + juce::String(cycles));
+}
+
+void FFTOSC::stopAutoplayToggleTest()
+{
+    if (autoplayTestRunning.load())
+    {
+        autoplayTestRunning.store(false);
+        if (autoplayTestThread.joinable())
+            autoplayTestThread.join();
+        juce::Logger::writeToLog("Autoplay-toggle test stopped");
+    }
+}
+
+void FFTOSC::setDisplayNoiseFloorDb(double db)
+{
+    displayMinDb = (float)db;
+    juce::Logger::writeToLog("Display noise-floor (min dB) set to " + juce::String(displayMinDb));
+}
+
+double FFTOSC::getDisplayNoiseFloorDb() const
+{
+    return (double)displayMinDb;
+}
+
+void FFTOSC::setHighPassCutoffHz(double hz)
+{
+    if (hz <= 0.0)
+    {
+        hpEnabled = false;
+        juce::Logger::writeToLog("High-pass filter disabled (cutoff <= 0)");
+        return;
+    }
+    hpEnabled = true;
+    hpCutoffHz = hz;
+    if (currentSampleRate > 0.0)
+    {
+        double fs = currentSampleRate;
+        double fc = std::max(0.0, hpCutoffHz);
+        hpAlpha = fs / (fs + 2.0 * M_PI * fc);
+    }
+    juce::Logger::writeToLog("High-pass filter cutoff set to " + juce::String(hpCutoffHz) + " Hz");
+}
+
+// runForcedFadeTest removed
+
+// runForcedFadeResumeTest removed
 
 void FFTOSC::stop()
 {
@@ -734,6 +894,8 @@ void FFTOSC::stop()
     if (playbackThread.joinable())
         playbackThread.join();
 
+    // file-feeder removed; nothing to stop here
+
     deviceManager.removeAudioCallback(this);
     deviceManager.closeAudioDevice();
     oscSender.disconnect();
@@ -746,11 +908,26 @@ void FFTOSC::audioDeviceAboutToStart (juce::AudioIODevice* device)
         currentSampleRate = device->getCurrentSampleRate();
         juce::String s = "Audio device started: " + device->getName() + " rate=" + juce::String(currentSampleRate);
         s += " inputs=" + juce::String(device->getActiveInputChannels().countNumberOfSetBits());
+        s += " outputs=" + juce::String(device->getActiveOutputChannels().countNumberOfSetBits());
         juce::Logger::writeToLog(s);
+        if (device->getActiveOutputChannels().countNumberOfSetBits() == 0 && filePlaybackEnabled)
+            juce::Logger::writeToLog("Warning: no active output channels — playback will be silent");
     }
 
     // prepare transportSource if file playback is enabled
     transportSource.prepareToPlay(512, currentSampleRate);
+
+    // compute high-pass filter alpha for simple 1st-order HP:
+    // alpha = fs / (fs + 2*pi*fc)
+    if (hpEnabled && currentSampleRate > 0.0)
+    {
+        double fs = currentSampleRate;
+        double fc = std::max(0.0, hpCutoffHz);
+        hpAlpha = fs / (fs + 2.0 * M_PI * fc);
+        hpXPrev = 0.0f;
+        hpYPrev = 0.0f;
+        juce::Logger::writeToLog("High-pass filter enabled: cutoff=" + juce::String(hpCutoffHz) + " Hz");
+    }
 }
 
 void FFTOSC::audioDeviceStopped()
@@ -762,6 +939,32 @@ void FFTOSC::audioDeviceStopped()
 
 void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelData, int numInputChannels, float* const* outputChannelData, int numOutputChannels, int numSamples, const juce::AudioIODeviceCallbackContext& context)
 {
+    // Periodic, low-rate diagnostics to verify microphone input is arriving.
+    static int inputDiagCallbackCounter = 0;
+    if ((++inputDiagCallbackCounter % 500) == 0)
+    {
+        juce::String s = "audio callback diag: numInputChannels=" + juce::String(numInputChannels)
+            + " numSamples=" + juce::String(numSamples)
+            + " numOutputChannels=" + juce::String(numOutputChannels);
+        juce::Logger::writeToLog(s);
+        for (int ch = 0; ch < numInputChannels; ++ch)
+        {
+            if (inputChannelData == nullptr || inputChannelData[ch] == nullptr)
+                juce::Logger::writeToLog("audio callback: inputChannelData[" + juce::String(ch) + "] is null");
+            else
+            {
+                // compute RMS of first channel sample block for diagnostics
+                double sum = 0.0;
+                const float* in = inputChannelData[ch];
+                for (int i = 0; i < numSamples; ++i) sum += (double)in[i] * (double)in[i];
+                double rms = (numSamples > 0) ? std::sqrt(sum / (double)numSamples) : 0.0;
+                juce::Logger::writeToLog("audio callback: ch=" + juce::String(ch) + " rms=" + juce::String(rms));
+            }
+        }
+    }
+
+    // (debug passthrough removed)
+
     // Mix input channels to mono and push into FIFO
     juce::AudioBuffer<float> tmpBuf;
     juce::AudioSourceChannelInfo tmpInfo;
@@ -773,42 +976,87 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
         transportSource.getNextAudioBlock(tmpInfo);
         havePlaybackBuf = true;
     }
-
+    bool transportPlaying = transportSource.isPlaying();
+    float maxAbsMic = 0.0f;
+    float sumSquares = 0.0f;
+    // diagnostics: accumulate output energy so we can verify audible output
+    static double outSumSquares = 0.0;
+    static int outSamplesCount = 0;
+    
     for (int i = 0; i < numSamples; ++i)
     {
-        float sample = 0.0f;
+        float micSample = 0.0f;
+        // mix input channels to mono (if present)
+        for (int ch = 0; ch < numInputChannels; ++ch)
+        {
+            const float* in = inputChannelData[ch];
+            if (in != nullptr)
+                micSample += in[i];
+        }
+        if (numInputChannels > 0)
+            micSample /= (float) numInputChannels;
 
+        // apply simple 1st-order high-pass filter to mic input
+        if (hpEnabled)
+        {
+            float y = (float)(hpAlpha * (hpYPrev + micSample - hpXPrev));
+            hpXPrev = micSample;
+            hpYPrev = y;
+            micSample = y;
+        }
+
+        // track peak absolute level for lastInputLevel (used by mic-ducking)
+        float absMic = std::abs(micSample);
+        if (absMic > maxAbsMic)
+            maxAbsMic = absMic;
+
+        // accumulate for RMS computation (mic only)
+        if (numInputChannels > 0)
+            sumSquares += micSample * micSample;
+
+        float playbackSample = 0.0f;
         if (filePlaybackEnabled && havePlaybackBuf)
         {
-            // mix channels for this sample index
+            // mix channels from playback buffer
             float s = 0.0f;
             int chans = tmpBuf.getNumChannels();
             for (int ch = 0; ch < chans; ++ch)
                 s += tmpBuf.getSample(ch, i);
             if (chans > 0) s /= (float)chans;
-            sample = s;
+            playbackSample = s;
         }
-        else if (testToneEnabled.load())
+
+        float sample = 0.0f;
+        // Mix sources instead of choosing one: mic + playback (with playbackGain)
+        // and optional test tone are all summed so both mic and playback are audible.
+        float testSample = 0.0f;
+        if (testToneEnabled.load())
         {
-            // generate sine test tone
             double inc = 2.0 * M_PI * (double)testFreqHz / currentSampleRate;
-            sample = (float)std::sin(phase);
+            testSample = (float)std::sin(phase);
             phase += inc;
             if (phase > (2.0 * M_PI)) phase -= (2.0 * M_PI);
         }
-        else
-        {
-            for (int ch = 0; ch < numInputChannels; ++ch)
-            {
-                const float* in = inputChannelData[ch];
-                if (in != nullptr)
-                    sample += in[i];
-            }
-            if (numInputChannels > 0)
-                sample /= (float) numInputChannels;
-        }
 
-        // write computed sample to outputs if present (test tone or input-derived)
+        float mixedPlayback = 0.0f;
+        if (transportPlaying && filePlaybackEnabled && havePlaybackBuf)
+            mixedPlayback = playbackSample * playbackGain.load();
+
+        float mixedMic = micSample;
+
+        sample = mixedMic + mixedPlayback + testSample;
+
+        
+
+        // Simply mix sources: mic + playback + test tone are summed directly.
+        // Do not normalize by active source count — keep mixing behavior simple.
+        // Clamping below prevents clipping.
+
+        // simple clamp to avoid clipping
+        if (sample > 1.0f) sample = 1.0f;
+        if (sample < -1.0f) sample = -1.0f;
+
+        // write computed sample to outputs if present
         if (outputChannelData != nullptr)
         {
             for (int outCh = 0; outCh < numOutputChannels; ++outCh)
@@ -819,64 +1067,77 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
                     out[i] = sample;
                 }
             }
+            // accumulate output energy for diagnostics
+            outSumSquares += (double)sample * (double)sample;
+            ++outSamplesCount;
         }
 
-        fifo[fifoIndex++] = sample;
-
-        if (fifoIndex >= fftSize)
+        // Feed all available sources into the FFT for analysis. Mic and
+        // playback samples are both pushed when present (mic first).
+        // Sometimes playback may be audibly turned down, but we still want
+        // its spectral content to contribute to the FFT.
+        if (numInputChannels > 0)
         {
-            // copy fifo into fftData (first half)
-            for (int j = 0; j < fftSize; ++j)
-                fftData[j] = fifo[j];
-
-            // remove DC offset (mean) before windowing to avoid DC dominating low bins
-            {
-                float mean = 0.0f;
-                for (int j = 0; j < fftSize; ++j)
-                    mean += fftData[j];
-                mean /= (float) fftSize;
-                if (std::abs(mean) > 1e-12f)
-                {
-                    for (int j = 0; j < fftSize; ++j)
-                        fftData[j] -= mean;
-                }
-            }
-
-            // apply window in-place
-            window.multiplyWithWindowingTable(fftData.data(), (size_t) fftSize);
-
-            // perform frequency-only forward transform (outputs magnitudes into fftData)
-            fft->performFrequencyOnlyForwardTransform(fftData.data(), true);
-
-            // copy first half magnitudes
-            std::vector<float> amps(fftSize / 2);
-            for (int b = 0; b < fftSize / 2; ++b)
-                amps[b] = fftData[b];
-
-            // store latest amplitudes under lock
-            const juce::ScopedLock sl(amplitudesLock);
-            latestAmplitudes = std::move(amps);
-
-            // occasional log to confirm FFT was produced
-            if (++fftProducedCounter % 10 == 0)
-            {
-                juce::String s = "FFT produced count=" + juce::String(latestAmplitudes.size()) + " first=" + juce::String(latestAmplitudes[0]);
-                juce::Logger::writeToLog(s);
-            }
-
-            // reset fifo index
-            fifoIndex = 0;
+            float s = micSample;
+            pushSamplesToFFT(&s, 1);
         }
+        if (filePlaybackEnabled && havePlaybackBuf)
+        {
+            // Feed the playback sample into the FFT after applying the
+            // current playback gain so the visualizer matches audible output.
+            float scaledPlayback = playbackSample * playbackGain.load();
+            // Skip pushing silent playback to FFT to avoid showing inaudible content
+            if (std::abs(scaledPlayback) > 1e-12f)
+            {
+                float s = scaledPlayback;
+                pushSamplesToFFT(&s, 1);
+            }
+        }
+        // If neither mic nor playback are available, push the mixed/selected
+        // `sample` (test tone or silence) so FFT still runs.
+        if (numInputChannels == 0 && !(filePlaybackEnabled && havePlaybackBuf))
+        {
+            float s = sample;
+            pushSamplesToFFT(&s, 1);
+        }
+    }
+
+    // publish the maximum input level observed during this callback for
+    // the timer thread to consult when making mic-fade decisions.
+    lastInputLevel.store(maxAbsMic);
+
+    // publish RMS of mic samples for use by the timer-driven fade state machine
+    if (numInputChannels > 0 && numSamples > 0)
+    {
+        float rms = std::sqrt(sumSquares / (float)numSamples);
+        lastInputRms.store(rms);
     }
 
     // occasional diagnostic for playback state (not every callback)
     static int playbackDiagCounter = 0;
     if ((++playbackDiagCounter % 500) == 0 && filePlaybackEnabled)
     {
+        double outRms = 0.0;
+        if (outSamplesCount > 0)
+            outRms = std::sqrt(outSumSquares / (double)outSamplesCount);
         juce::Logger::writeToLog("audio callback diag: numOutputChannels=" + juce::String(numOutputChannels)
                                   + " transportPlaying=" + juce::String(transportSource.isPlaying() ? "yes" : "no")
                                   + " pos=" + juce::String(transportSource.getCurrentPosition())
-                                  + " len=" + juce::String(transportSource.getLengthInSeconds()) );
+                                  + " len=" + juce::String(transportSource.getLengthInSeconds())
+                                  + " outRms=" + juce::String(outRms)
+                                  + " playbackGain=" + juce::String(playbackGain.load()));
+        outSumSquares = 0.0;
+        outSamplesCount = 0;
+    }
+    // periodic input diagnostics: every ~1s (timer runs at 50ms); only when senderDiag enabled
+    static int inputDiagCounter = 0;
+    if (senderDiag && (++inputDiagCounter % 20) == 0)
+    {
+        float micRmsVal = lastInputRms.load();
+        float micPeakVal = lastInputLevel.load();
+        juce::Logger::writeToLog("DIAG_INPUT: rms=" + juce::String(micRmsVal)
+                                 + " peak=" + juce::String(micPeakVal)
+                                 + " playbackGain=" + juce::String(playbackGain.load()));
     }
     // If the transport has stopped but position indicates end-of-file, request next file.
     if (filePlaybackEnabled)
@@ -885,7 +1146,7 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
         double len = transportSource.getLengthInSeconds();
         if (len > 0.0 && !transportSource.isPlaying() && pos >= (len - 0.05) && pos > 0.01)
         {
-            juce::Logger::writeToLog("audio callback: detected EOF pos=" + juce::String(pos) + " len=" + juce::String(len) + ", requesting next file");
+            if (verboseLogging) juce::Logger::writeToLog("audio callback: detected EOF pos=" + juce::String(pos) + " len=" + juce::String(len) + ", requesting next file");
             nextFileRequested.store(true);
         }
     }
@@ -904,11 +1165,45 @@ void FFTOSC::timerCallback()
 
     if (ampsCopy.empty())
     {
-        // occasionally report that we have no data yet
         if (++sendCounter % 30 == 0)
             juce::Logger::writeToLog("No FFT amplitudes available yet");
-        return;
+        // continue — allow timer logic to run based on time-domain RMS
     }
+    // Use time-domain RMS input level for fade decisions; auto-playback and
+    // automatic resume/start logic have been removed. This block only
+    // implements mic-driven fade-down of playback gain when sustained
+    // input energy is present.
+    {
+        // Consider both RMS and peak levels for robust detection across
+        // different mic setups. Use the larger of RMS and peak so short
+        // vocal bursts and sustained speech both trigger the fade reliably.
+        float micRms = lastInputRms.load();
+        float micPeak = lastInputLevel.load();
+        float micLevel = std::max(micRms, micPeak);
+
+        if (verboseLogging)
+        {
+            juce::Logger::writeToLog("DEBUG_TIMER: micLevel=" + juce::String(micLevel)
+                                     + " rms=" + juce::String(micRms)
+                                     + " peak=" + juce::String(micPeak)
+                                     + " playbackGain=" + juce::String(playbackGain.load()));
+        }
+
+        // compute peak of latest amplitudes (kept for diagnostics only)
+        float peak = 0.0f;
+        float scale = (fftSize > 0) ? (1.0f / (float) fftSize) : 1.0f;
+        for (size_t i = 0; i < ampsCopy.size(); ++i)
+        {
+            float v = ampsCopy[i];
+            if (!std::isfinite(v)) v = 0.0f;
+            v *= scale;
+            if (v > peak) peak = v;
+        }
+
+        // Mic-ducking is handled in senderLoop; nothing to do here.
+        (void) micLevel;
+    }
+    // (manual resume paths removed - no automatic/manual resume on mic inactivity)
     // handle any requested next-file events from audio thread
     if (nextFileRequested.exchange(false))
     {
@@ -921,6 +1216,7 @@ void FFTOSC::timerCallback()
             {
                 if (urnIndices.empty())
                 {
+                    // reserve spaces in the vector to avoid reallocations
                     urnIndices.reserve((int)playbackFiles.size());
                     for (int i = 0; i < (int)playbackFiles.size(); ++i)
                         urnIndices.push_back(i);
@@ -952,7 +1248,13 @@ void FFTOSC::timerCallback()
                 readerSource.reset(new juce::AudioFormatReaderSource(reader.release(), true));
                 currentFileLengthSeconds = (double)readerSource->getTotalLength() / readerSource->getAudioFormatReader()->sampleRate;
                 transportSource.setSource(readerSource.get(), 0, nullptr, readerSource->getAudioFormatReader()->sampleRate);
+                transportSource.setPosition(0.0);
                 transportSource.start();
+                {
+                    auto now = std::chrono::steady_clock::now();
+                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+                    lastPlaybackStartMs.store((long long)ms);
+                }
                 juce::Logger::writeToLog("Started playback: " + f.getFullPathName() + " seqIndex=" + juce::String(sequentialIndex));
             }
             else
@@ -977,4 +1279,47 @@ void FFTOSC::timerCallback()
         }
     }
     // Sending is now handled by the sender thread; timerCallback will not transmit OSC.
+}
+
+void FFTOSC::pushSamplesToFFT(const float* samples, int numSamples)
+{
+    juce::ScopedLock gl(amplitudesLock); // protect fifoIndex and fftData operations
+    for (int si = 0; si < numSamples; ++si)
+    {
+        fifo[fifoIndex++] = samples[si];
+        if (fifoIndex >= fftSize)
+        {
+            // copy fifo into fftData (first half)
+            for (int j = 0; j < fftSize; ++j)
+                fftData[j] = fifo[j];
+
+            // remove DC offset
+            float mean = 0.0f;
+            for (int j = 0; j < fftSize; ++j)
+                mean += fftData[j];
+            mean /= (float) fftSize;
+            if (std::abs(mean) > 1e-12f)
+            {
+                for (int j = 0; j < fftSize; ++j)
+                    fftData[j] -= mean;
+            }
+
+            window.multiplyWithWindowingTable(fftData.data(), (size_t) fftSize);
+            fft->performFrequencyOnlyForwardTransform(fftData.data(), true);
+
+            std::vector<float> amps(fftSize / 2);
+            for (int b = 0; b < fftSize / 2; ++b)
+                amps[b] = fftData[b];
+
+            latestAmplitudes = std::move(amps);
+            if (++fftProducedCounter % 10 == 0)
+            {
+                juce::String s = "FFT produced count=" + juce::String(latestAmplitudes.size()) + " first=" + juce::String(latestAmplitudes[0]);
+                if (verboseLogging)
+                    juce::Logger::writeToLog(s);
+            }
+
+            fifoIndex = 0;
+        }
+    }
 }

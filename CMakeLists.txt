@@ -2,29 +2,23 @@ cmake_minimum_required(VERSION 3.15)
 project(juce-fft-osc LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 
-## Ensure JUCE is available. If not present, fetch the JUCE source and
-# add it as a subdirectory so CMake can build the JUCE targets directly.
-include(FetchContent)
-FetchContent_Declare(
-    juce
-    GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
-    GIT_TAG master
-    GIT_SHALLOW TRUE
-)
-FetchContent_GetProperties(juce)
-if(NOT juce_POPULATED)
-    FetchContent_Populate(juce)
-endif()
+find_package(JUCE CONFIG QUIET)
 
-add_subdirectory(${juce_SOURCE_DIR} ${juce_BINARY_DIR} EXCLUDE_FROM_ALL)
+# If JUCE isn't available on the system, fetch it automatically via FetchContent
+if (NOT JUCE_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(
+        juce
+        GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+        GIT_TAG 8.0.12
+    )
+    FetchContent_MakeAvailable(juce)
+endif()
 
 juce_add_console_app(juce_fft_osc
     PRODUCT_NAME "JUCE FFT OSC"
     VERSION 0.1.0
 )
-
-# Ensure the JUCE amalgamated header is generated for this target
-juce_generate_juce_header(juce_fft_osc)
 
 target_sources(juce_fft_osc PRIVATE
     src/Main.cpp
