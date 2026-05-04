@@ -1,6 +1,6 @@
 # JUCE FFT → OSC
 
-Captures audio from the system microphone, performs an FFT, and sends per-band amplitudes as an OSC message (`/fft/amplitudes`, 64 floats) at a configurable rate. Optionally plays audio files from a directory, with mic-ducking to automatically fade playback out when someone speaks.
+Captures audio, performs an FFT, and sends per-band amplitudes as an OSC message (`/fft/amplitudes`, 64 floats) at a configurable rate. Plays audio files from a directory, with mic-ducking to automatically fade playback out when someone speaks.
 
 ## Requirements
 
