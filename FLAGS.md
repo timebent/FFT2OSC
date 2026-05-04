@@ -1,82 +1,67 @@
-Command-line flags — quick reference
+# FFT2OSC CLI Flags
 
-This file is a compact summary of runtime flags and a few common invocation examples.
+All flags use `--flag=value` style. Boolean flags have no value.
 
-## Network / OSC
+## Network
 
-- `--host HOST`                  OSC destination host (default: 127.0.0.1)
-- `--port PORT`                  OSC destination port (default: 57120)
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host=HOST` | `127.0.0.1` | OSC destination host |
+| `--port=PORT` | `57120` | OSC destination port |
 
-## General
+## File Playback
 
-- `-h`, `--help`                 Show usage
-- `--quiet`                      Suppress non-essential log output
-- `--diag-sender`                Enable sender diagnostics and payload dumps
-- `--diag-sender=N`              Enable diagnostics; dump N full OSC payloads
-- `--sender-interval N`          Send interval in ms (aliases: `--sender-interval=N`, `--senderInterval N`, `--senderInterval=N`, `--senderIntervalMs=N`)
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--play-dir=PATH` | — | Play all audio files in a directory |
+| `--play-files=FILE,FILE,...` | — | Play specific comma-separated files |
+| `--shuffle-play` | off | Shuffle playback order |
 
-## FFT / frequency mapping
+## Mic-Ducking and Auto-Playback
 
-- `--map-min <Hz>`               Lowest frequency mapped to band 0 (aliases: `--map-min=`, `--mapMinFreq=`, `--mapMinFreq`)
-- `--map-max <Hz>`               Highest frequency mapped to last band (aliases: `--map-max=`, `--mapMaxFreq=`, `--mapMaxFreq`)
-- `--rms-agg`                    Use RMS aggregation when downsampling FFT bins
-- `--rms-agg=N`                  Enable (N≠0) or disable (N=0) RMS aggregation
-- `--no-rms`                     Disable RMS aggregation
-- `--display-noise-floor-db=X`   Noise floor in dBFS for display normalisation (default: -60)
-- `--hp-cutoff=X`                High-pass filter cutoff in Hz (aliases: `--hpCutoff=`, `--hp-cutoff X`)
+These two features are independent and can be used together. A typical setup uses both: auto-playback starts a file when the mic is quiet, and mic-ducking fades it out when the mic gets loud again.
 
-## Voice filtering
+### Mic-Ducking — fade out when mic is loud
 
-- `--voice-only`                 Zero non-voice FFT bins before sending
-- `--voice-only=0|1`             Enable/disable voice-only masking (aliases: `--voiceOnly=`, `--voiceOnly`)
-- `--voice-min <Hz>`             Voice lower bound in Hz (alias: `--voice-min=`)
-- `--voice-max <Hz>`             Voice upper bound in Hz (alias: `--voice-max=`)
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--suspend-threshold-db=X` | — | Enable mic-ducking; duck when mic exceeds X dBFS for 500 ms |
 
-## File playback
+State machine: mic above threshold for 500 ms → fade out (2 s) → hold silent (10 s) → fade back in (30 s). A re-trigger during hold or fade-up restarts from the beginning.
 
-- `--play-dir <path>`            Play all supported audio files in directory (alias: `--play-dir=`)
-- `--play-files=<list>`          Comma-separated list of audio files to play
-- `--shuffle-play`               Shuffle file playback order
+### Auto-Playback — start playback when mic is quiet
 
-## Auto-playback (start playback when mic is quiet)
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--auto-playback` | off | Start file playback when mic falls below threshold |
+| `--auto-play-threshold-db=X` | `-40` | Mic must be below this level (dBFS) to be considered quiet |
+| `--auto-play-hold-ms=MS` | — | Duration mic must stay quiet before playback starts |
 
-- `--auto-playback`              Enable auto file playback when mic is silent
-- `--auto-play-threshold-db=X`  Silence threshold in dBFS to trigger playback (default: -40)
-- `--auto-play-hold-ms=X`       How long mic must be silent before playback starts (ms)
+## FFT / Frequency
 
-## Mic-ducking (duck playback when mic is loud)
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--map-min=HZ` | `80` | Lowest frequency to include in FFT output |
+| `--map-max=HZ` | `24000` | Highest frequency to include in FFT output |
+| `--hp-cutoff=HZ` | — | High-pass filter cutoff frequency |
+| `--rms-agg` | off | Use RMS aggregation when downsampling bins |
+| `--no-rms` | off | Disable RMS aggregation |
+| `--display-noise-floor-db=X` | `-60` | Noise floor for display normalisation |
 
-State machine: Idle → FadingDown (2 s) → Holding (10 s) → FadingUp (30 s) → Idle.
-Re-triggering during Holding or FadingUp restarts the cycle from FadingDown.
+## Voice Filtering
 
-- `--suspend-threshold-db=X`    Enable mic-ducking; duck when mic exceeds X dBFS for 500 ms (e.g. -40)
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--voice-only` | off | Zero non-voice FFT bins before sending |
+| `--voice-min=HZ` | `80` | Voice band lower bound |
+| `--voice-max=HZ` | `3000` | Voice band upper bound |
 
-## Test tone
+## Test / Diagnostics
 
-- `--test-tone <Hz>`            Enable built-in sine test tone at given frequency (aliases: `--testTone=`, `--testTone`)
-
-## Diagnostics / development
-
-- `--autoplay-toggle=playMs:cycles`  Toggle auto-playback on/off for testing (cycles=0 = continuous)
-
----
-
-## Common examples
-
-Send to localhost:57122, shuffle-play files from `numbers/`, duck on voice:
-
-```bash
-./build/juce_fft_osc_artefacts/juce_fft_osc --port 57122 --play-dir=./numbers --shuffle-play --suspend-threshold-db=-40
-```
-
-Auto-playback when mic is silent:
-
-```bash
-./build/juce_fft_osc_artefacts/juce_fft_osc --port 57122 --play-dir=./numbers --auto-playback --auto-play-threshold-db=-40 --auto-play-hold-ms=1500
-```
-
-Basic send with diagnostics:
-
-```bash
-./build/juce_fft_osc_artefacts/juce_fft_osc --port 57120 --diag-sender
-```
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--test-tone=HZ` | — | Enable built-in sine test tone at given frequency |
+| `--sender-interval=MS` | `33` | OSC send interval in milliseconds |
+| `--diag-sender` | off | Print per-send diagnostics |
+| `--autoplay-toggle=MS:CYCLES` | — | Toggle auto-playback every MS ms for CYCLES cycles (testing) |
+| `-h`, `--help` | — | Show help and exit |
