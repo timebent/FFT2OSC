@@ -1,4 +1,3 @@
-#include <JuceHeader.h>
 #include "FFTOSC.h"
 #include <thread>
 #include <chrono>

@@ -30,7 +30,9 @@ target_compile_definitions(juce_fft_osc PRIVATE JUCE_APPLICATION_NO_GUI=1)
 
 target_link_libraries(juce_fft_osc PRIVATE
     juce::juce_core
+    juce::juce_events
     juce::juce_audio_basics
+    juce::juce_audio_formats
     juce::juce_audio_devices
     juce::juce_dsp
     juce::juce_osc
