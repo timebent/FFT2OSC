@@ -634,7 +634,7 @@ void FFTOSC::start()
                 bool playing = transportSource.isPlaying();
                 if (len > 0.0 && !playing && pos >= (len - 0.05) && pos > 0.01)
                 {
-                    juce::Logger::writeToLog("playbackThread: detected EOF pos=" + juce::String(pos) + " len=" + juce::String(len));
+                    if (verboseLogging) juce::Logger::writeToLog("playbackThread: detected EOF pos=" + juce::String(pos) + " len=" + juce::String(len));
                     // start next file under playbackMutex to avoid races
                     std::lock_guard<std::mutex> lg(playbackMutex);
                     if (!playbackFiles.empty())
@@ -692,7 +692,7 @@ void FFTOSC::start()
                                 lastPlaybackStartMs.store((long long)ms);
                             }
                             currentFileIndex = idx;
-                            juce::Logger::writeToLog("playbackThread: Started playback: " + f.getFullPathName());
+                            if (verboseLogging) juce::Logger::writeToLog("playbackThread: Started playback: " + f.getFullPathName());
                         }
                         else
                         {
@@ -705,7 +705,7 @@ void FFTOSC::start()
             // Observe any external requests to start the next file (e.g. from audio thread)
             if (nextFileRequested.exchange(false))
             {
-                juce::Logger::writeToLog("playbackThread: nextFileRequested observed");
+                if (verboseLogging) juce::Logger::writeToLog("playbackThread: nextFileRequested observed");
                 // start next file under playbackMutex to avoid races
                 std::lock_guard<std::mutex> lg(playbackMutex);
                 if (!playbackFiles.empty())
@@ -756,7 +756,7 @@ void FFTOSC::start()
                             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
                             lastPlaybackStartMs.store((long long)ms);
                         }
-                        juce::Logger::writeToLog("playbackThread: Started playback (requested): " + f.getFullPathName());
+                        if (verboseLogging) juce::Logger::writeToLog("playbackThread: Started playback (requested): " + f.getFullPathName());
                     }
                     else
                     {
@@ -1129,9 +1129,9 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
         outSumSquares = 0.0;
         outSamplesCount = 0;
     }
-    // periodic input diagnostics: every ~1s (timer runs at 50ms)
+    // periodic input diagnostics: every ~1s (timer runs at 50ms); only when senderDiag enabled
     static int inputDiagCounter = 0;
-    if ((++inputDiagCounter % 20) == 0)
+    if (senderDiag && (++inputDiagCounter % 20) == 0)
     {
         float micRmsVal = lastInputRms.load();
         float micPeakVal = lastInputLevel.load();
@@ -1146,7 +1146,7 @@ void FFTOSC::audioDeviceIOCallbackWithContext (const float* const* inputChannelD
         double len = transportSource.getLengthInSeconds();
         if (len > 0.0 && !transportSource.isPlaying() && pos >= (len - 0.05) && pos > 0.01)
         {
-            juce::Logger::writeToLog("audio callback: detected EOF pos=" + juce::String(pos) + " len=" + juce::String(len) + ", requesting next file");
+            if (verboseLogging) juce::Logger::writeToLog("audio callback: detected EOF pos=" + juce::String(pos) + " len=" + juce::String(len) + ", requesting next file");
             nextFileRequested.store(true);
         }
     }
