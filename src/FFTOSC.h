@@ -184,7 +184,7 @@ private:
     float displayMinDb = -60.0f;
 
     // runtime verbosity: when false, suppress non-essential diagnostic logs
-    bool verboseLogging = true;
+    bool verboseLogging = false;
 
     // push samples directly into FIFO and run FFT when ready (usable by feeder)
     void pushSamplesToFFT(const float* samples, int numSamples);
