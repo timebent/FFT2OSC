@@ -18,17 +18,17 @@ cmake --build build
 ```
 
 Binary location after build:
-- **macOS/Linux**: `build/juce_fft_osc_artefacts/juce_fft_osc`
+- **macOS/Linux**: `build/juce_fft_osc_artefacts/Release/juce_fft_osc`
 - **Windows**: `build\Release\juce_fft_osc.exe`
 
 ## Run
 
 ```bash
 # Basic — send FFT to localhost:57122
-./build/juce_fft_osc_artefacts/juce_fft_osc --port 57122
+./build/juce_fft_osc_artefacts/Release/juce_fft_osc --port 57122
 
 # Shuffle-play audio files and duck when mic exceeds -40 dBFS. The audio files should be in a directory in the project root. In this example, the directory is `numbers/`.
-./build/juce_fft_osc_artefacts/juce_fft_osc \
+./build/juce_fft_osc_artefacts/Release/juce_fft_osc \
   --port 57122 \
   --play-dir=./numbers \
   --shuffle-play \
