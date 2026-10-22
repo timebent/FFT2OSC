@@ -28,10 +28,10 @@ Binary location after build:
 ./build/juce_fft_osc_artefacts/Release/juce_fft_osc --port 57122
 
 # Shuffle-play audio files and duck when mic exceeds -40 dBFS. The audio files should be in a directory in the project root. In this example, the directory is `numbers/`.
-./build/juce_fft_osc_artefacts/Release/juce_fft_osc \
-  --port 57122 \
-  --play-dir=./numbers \
-  --shuffle-play \
+./build/juce_fft_osc_artefacts/Release/juce_fft_osc 
+  --port 57122 
+  --play-dir=./numbers 
+  --shuffle-play 
   --suspend-threshold-db=-40
 ```
 
